@@ -1,7 +1,7 @@
 """
 Fine-tune Qwen3-Coder-Next-Base on Modal using QLoRA (4-bit) with Unsloth.
 
-Runs on a single B200 GPU (180GB VRAM). Uses the UIGEN dataset in ChatML
+Runs on a single GPU (A100/H100/H200). Uses the UIGEN dataset in ChatML
 format from a Modal Volume. Logs metrics to W&B and sends an alert on completion.
 
 Usage:
@@ -51,10 +51,7 @@ with train_image.imports():
 
     import json
     import os
-    import yaml
-    from typing import Dict, List, Optional
-
-    import numpy as np
+    import runpy
     import torch
     import wandb
     from datasets import Dataset
@@ -74,10 +71,9 @@ checkpoint_vol = modal.Volume.from_name("uiux-checkpoints", create_if_missing=Tr
 TIMEOUT_HOURS = 6
 MAX_RETRIES = 1
 
-# LoRA target modules — all linear layers for best quality
+# LoRA target modules — attention-only
 LORA_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
-    "gate_proj", "up_proj", "down_proj",
 ]
 
 
@@ -109,7 +105,7 @@ class TrainingConfig:
 
     # Data
     train_size: int = 32  # Number of training samples to load
-    val_size: int = 10  # Number of validation samples to load
+    val_size: int = 0  # Number of validation samples to load (0 disables eval)
 
     # Logging
     logging_steps: int = 1
@@ -127,6 +123,7 @@ class TrainingConfig:
     # Experiment
     seed: int = 42
     experiment_name: Optional[str] = None
+    wandb_project: str = "uiux-train"
 
     def __post_init__(self):
         if self.experiment_name is None:
@@ -135,39 +132,41 @@ class TrainingConfig:
             self.experiment_name = f"{model_short}-r{self.lora_r}-{timestamp}"
 
 
-def load_config_from_file() -> dict:
+def load_config_from_file(config_file: str) -> dict:
     """Load training configuration from Python config file."""
     try:
-        # Import the config module
-        import sys
-        sys.path.insert(0, "/Users/lilyzhang/Desktop/Qwen3-Coder/finetuning")
-        import train_config as cfg
-        
+        if not os.path.exists(config_file):
+            print(f"⚠️  Config file not found: {config_file}, using defaults")
+            return {}
+
+        cfg = runpy.run_path(config_file)
+
         return {
-            "model_name": cfg.MODEL_NAME,
-            "max_seq_length": cfg.MAX_SEQ_LENGTH,
-            "load_in_4bit": cfg.LOAD_IN_4BIT,
-            "lora_r": cfg.LORA_R,
-            "lora_alpha": cfg.LORA_ALPHA,
-            "lora_dropout": cfg.LORA_DROPOUT,
-            "learning_rate": cfg.LEARNING_RATE,
-            "num_epochs": cfg.NUM_EPOCHS,
-            "max_steps": cfg.MAX_STEPS,
-            "batch_size": cfg.BATCH_SIZE,
-            "gradient_accumulation_steps": cfg.GRADIENT_ACCUMULATION_STEPS,
-            "gradient_checkpointing": cfg.GRADIENT_CHECKPOINTING,
-            "warmup_ratio": cfg.WARMUP_RATIO,
-            "weight_decay": cfg.WEIGHT_DECAY,
-            "lr_scheduler_type": cfg.LR_SCHEDULER_TYPE,
-            "train_size": cfg.TRAIN_SIZE,
-            "val_size": cfg.VAL_SIZE,
-            "logging_steps": cfg.LOGGING_STEPS,
-            "save_steps": cfg.SAVE_STEPS,
-            "eval_steps": cfg.EVAL_STEPS,
-            "ui_metrics_enabled": cfg.UI_METRICS_ENABLED,
-            "ui_metrics_log_every": cfg.UI_METRICS_LOG_EVERY,
-            "ui_metrics_render_screenshots": cfg.UI_METRICS_RENDER_SCREENSHOTS,
-            "gpu_type": cfg.GPU_TYPE,
+            "model_name": cfg.get("MODEL_NAME"),
+            "max_seq_length": cfg.get("MAX_SEQ_LENGTH"),
+            "load_in_4bit": cfg.get("LOAD_IN_4BIT"),
+            "lora_r": cfg.get("LORA_R"),
+            "lora_alpha": cfg.get("LORA_ALPHA"),
+            "lora_dropout": cfg.get("LORA_DROPOUT"),
+            "learning_rate": cfg.get("LEARNING_RATE"),
+            "num_epochs": cfg.get("NUM_EPOCHS"),
+            "max_steps": cfg.get("MAX_STEPS"),
+            "batch_size": cfg.get("BATCH_SIZE"),
+            "gradient_accumulation_steps": cfg.get("GRADIENT_ACCUMULATION_STEPS"),
+            "gradient_checkpointing": cfg.get("GRADIENT_CHECKPOINTING"),
+            "warmup_ratio": cfg.get("WARMUP_RATIO"),
+            "weight_decay": cfg.get("WEIGHT_DECAY"),
+            "lr_scheduler_type": cfg.get("LR_SCHEDULER_TYPE"),
+            "train_size": cfg.get("TRAIN_SIZE"),
+            "val_size": cfg.get("VAL_SIZE"),
+            "logging_steps": cfg.get("LOGGING_STEPS"),
+            "save_steps": cfg.get("SAVE_STEPS"),
+            "eval_steps": cfg.get("EVAL_STEPS"),
+            "ui_metrics_enabled": cfg.get("UI_METRICS_ENABLED"),
+            "ui_metrics_log_every": cfg.get("UI_METRICS_LOG_EVERY"),
+            "ui_metrics_render_screenshots": cfg.get("UI_METRICS_RENDER_SCREENSHOTS"),
+            "gpu_type": cfg.get("GPU_TYPE"),
+            "wandb_project": cfg.get("WANDB_PROJECT"),
         }
     except Exception as e:
         print(f"⚠️  Error loading config: {e}, using defaults")
@@ -211,7 +210,7 @@ def load_training_data(tokenizer, train_size: int = 100, val_size: int = 10):
     train_dataset = format_samples(train_samples)
 
     val_dataset = None
-    if os.path.exists(val_path):
+    if val_size and os.path.exists(val_path):
         val_samples = read_jsonl(val_path, limit=val_size)
         print(f"Loaded {len(val_samples)} validation samples (limit: {val_size})")
         val_dataset = format_samples(val_samples)
@@ -386,7 +385,7 @@ def _finetune_impl(config: TrainingConfig):
         logging_steps=config.logging_steps,
         save_steps=config.save_steps,
         eval_steps=config.eval_steps,
-        eval_strategy="steps" if val_dataset else "no",
+        eval_strategy="no",
         save_strategy="steps",
         output_dir=checkpoint_path,
         report_to="wandb",

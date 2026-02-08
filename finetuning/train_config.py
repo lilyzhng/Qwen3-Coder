@@ -29,7 +29,7 @@ OPTIMIZER = "adamw_8bit"
 
 # Data Configuration
 TRAIN_SIZE = 32  # Number of training samples to load
-VAL_SIZE = 10    # Number of validation samples to load
+VAL_SIZE = 0     # Number of validation samples to load (0 disables eval)
 
 # Logging & Checkpointing
 LOGGING_STEPS = 1
