@@ -141,7 +141,7 @@ def load_config_from_file(config_file: str) -> dict:
 
         cfg = runpy.run_path(config_file)
 
-        return {
+        cfg_dict = {
             "model_name": cfg.get("MODEL_NAME"),
             "max_seq_length": cfg.get("MAX_SEQ_LENGTH"),
             "load_in_4bit": cfg.get("LOAD_IN_4BIT"),
@@ -168,6 +168,7 @@ def load_config_from_file(config_file: str) -> dict:
             "gpu_type": cfg.get("GPU_TYPE"),
             "wandb_project": cfg.get("WANDB_PROJECT"),
         }
+        return {k: v for k, v in cfg_dict.items() if v is not None}
     except Exception as e:
         print(f"⚠️  Error loading config: {e}, using defaults")
         return {}
@@ -180,6 +181,11 @@ def load_training_data(tokenizer, train_size: int = 100, val_size: int = 10):
     """Load ChatML JSONL data from the Modal volume and format for SFTTrainer."""
     train_path = "/training_data/data/uigen_train.jsonl"
     val_path = "/training_data/data/uigen_val.jsonl"
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(
+            f"Training data not found at {train_path}. "
+            "Check the uiux-training-data volume contents."
+        )
 
     def read_jsonl(path, limit: int = None):
         samples = []
@@ -249,41 +255,12 @@ def _finetune_impl(config: TrainingConfig):
 
     # Initialize W&B
     wandb.init(
-        project="uiux-train",
+        project=config.wandb_project,
         name=config.experiment_name,
         config=config.__dict__,
     )
     print(f"W&B run: {wandb.run.url}")
     
-    # Print config that was logged to W&B
-    print("\n" + "="*60)
-    print("📝 Config logged to W&B:")
-    print("="*60)
-    print(f"  Model: {config.model_name}")
-    print(f"  LoRA: r={config.lora_r}, alpha={config.lora_alpha}")
-    print(f"  Training:")
-    print(f"    - Learning rate: {config.learning_rate}")
-    print(f"    - Epochs: {config.num_epochs}, Max steps: {config.max_steps}")
-    print(f"    - Batch size: {config.batch_size}")
-    print(f"    - Grad accum: {config.gradient_accumulation_steps}")
-    print(f"    - Effective batch: {config.batch_size * config.gradient_accumulation_steps}")
-    print(f"    - Max seq length: {config.max_seq_length}")
-    print(f"    - Gradient checkpointing: {config.gradient_checkpointing}")
-    print(f"  Data:")
-    print(f"    - Train size: {config.train_size}")
-    print(f"    - Val size: {config.val_size}")
-    print(f"  Logging:")
-    print(f"    - Logging steps: {config.logging_steps}")
-    print(f"    - Save steps: {config.save_steps}")
-    print(f"    - Eval steps: {config.eval_steps}")
-    print(f"  UI Metrics:")
-    print(f"    - Enabled: {config.ui_metrics_enabled}")
-    print(f"    - Log every: {config.ui_metrics_log_every} steps")
-    print(f"    - Render screenshots: {config.ui_metrics_render_screenshots}")
-    print(f"  Hardware:")
-    print(f"    - GPU: {config.gpu_type}")
-    print("="*60 + "\n")
-
     # Print GPU and CPU memory info
     n_gpus = torch.cuda.device_count()
     for i in range(n_gpus):
@@ -349,11 +326,43 @@ def _finetune_impl(config: TrainingConfig):
         use_rslora=False,
     )
 
-    # Print parameter counts
+    # Print parameter counts + config summary (logged to W&B)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+    wandb.config.update({"lora_trainable_params": trainable_params}, allow_val_change=True)
+
+    print("\n" + "="*60)
+    print("📝 Config logged to W&B:")
+    print("="*60)
+    print(f"  Model: {config.model_name}")
+    print(f"  LoRA: r={config.lora_r}, alpha={config.lora_alpha}")
+    print(
+        f"  LoRA trainable params: {trainable_params:,} "
+        f"({100*trainable_params/total_params:.2f}% of total {total_params:,})"
+    )
+    print(f"  Training:")
+    print(f"    - Learning rate: {config.learning_rate}")
+    print(f"    - Epochs: {config.num_epochs}, Max steps: {config.max_steps}")
+    print(f"    - Batch size: {config.batch_size}")
+    print(f"    - Grad accum: {config.gradient_accumulation_steps}")
+    print(f"    - Effective batch: {config.batch_size * config.gradient_accumulation_steps}")
+    print(f"    - Max seq length: {config.max_seq_length}")
+    print(f"    - Gradient checkpointing: {config.gradient_checkpointing}")
+    print(f"  Data:")
+    print(f"    - Train size: {config.train_size}")
+    print(f"    - Val size: {config.val_size}")
+    print(f"  Logging:")
+    print(f"    - Logging steps: {config.logging_steps}")
+    print(f"    - Save steps: {config.save_steps}")
+    print(f"    - Eval steps: {config.eval_steps}")
+    print(f"    - W&B project: {config.wandb_project}")
+    print(f"  UI Metrics:")
+    print(f"    - Enabled: {config.ui_metrics_enabled}")
+    print(f"    - Log every: {config.ui_metrics_log_every} steps")
+    print(f"    - Render screenshots: {config.ui_metrics_render_screenshots}")
+    print(f"  Hardware:")
+    print(f"    - GPU: {config.gpu_type}")
+    print("="*60 + "\n")
     print_mem("After LoRA setup")
 
     # Load data
@@ -514,7 +523,7 @@ def main(
     """
     # Load config from Python file
     print(f"Loading config from {config_file}...")
-    file_config = load_config_from_file()
+    file_config = load_config_from_file(config_file)
     
     # Start with file config, then apply CLI overrides
     config_dict = {**file_config}  # Start with file values
@@ -555,6 +564,7 @@ def main(
     print(f"  Epochs: {config.num_epochs}, Max steps: {config.max_steps}")
     print(f"  Train size: {config.train_size}, Val size: {config.val_size}")
     print(f"  UI Metrics: enabled={config.ui_metrics_enabled}, log_every={config.ui_metrics_log_every}")
+    print(f"  W&B project: {config.wandb_project}")
     print(f"  Experiment: {config.experiment_name}")
     print()
 
