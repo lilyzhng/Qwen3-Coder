@@ -33,6 +33,7 @@ train_image = (
         "datasets",
         "hf-transfer",
         "wandb",
+        "numpy",  # For entropy calculations
     )
     .env({
         "HF_HOME": "/model_cache",
@@ -45,15 +46,184 @@ with train_image.imports():
 
     import json
     import os
+    import re
+    from collections import Counter
+    from html.parser import HTMLParser
+    from typing import Dict, List, Optional
 
+    import numpy as np
     import torch
     import wandb
     from datasets import Dataset
-    from transformers import TrainingArguments
+    from transformers import TrainerCallback, TrainingArguments
     from trl import SFTTrainer
     from unsloth import FastLanguageModel
 
+
+# ---------------------------------------------------------------------------
+# UI Code Metrics (SFT Monitoring)
+# ---------------------------------------------------------------------------
+class HTMLValidator(HTMLParser):
+    """Lightweight HTML validator to check syntax."""
+    
+    def __init__(self):
+        super().__init__()
+        self.errors = []
+        self.tag_stack = []
+        
+    def handle_starttag(self, tag, attrs):
+        self.tag_stack.append(tag)
+        
+    def handle_endtag(self, tag):
+        if not self.tag_stack:
+            self.errors.append(f"Unexpected closing tag: </{tag}>")
+        elif self.tag_stack[-1] == tag:
+            self.tag_stack.pop()
+        else:
+            self.errors.append(f"Tag mismatch: expected </{self.tag_stack[-1]}>, got </{tag}>")
+            
+    def is_valid(self):
+        return len(self.errors) == 0 and len(self.tag_stack) == 0
+
+
+def extract_tailwind_classes(code: str) -> List[str]:
+    """Extract Tailwind CSS classes from HTML/JSX code."""
+    class_patterns = [r'className=["\'](.*?)["\']', r'class=["\'](.*?)["\']']
+    classes = []
+    for pattern in class_patterns:
+        matches = re.findall(pattern, code)
+        for match in matches:
+            classes.extend(match.split())
+    return classes
+
+
+def extract_color_tokens(code: str) -> List[str]:
+    """Extract color-related tokens (Tailwind colors and hex codes)."""
+    colors = []
+    tailwind_colors = re.findall(r'\b(?:bg|text|border)-(\w+)-\d+\b', code)
+    colors.extend(tailwind_colors)
+    hex_colors = re.findall(r'#[0-9a-fA-F]{3,6}\b', code)
+    colors.extend(hex_colors)
+    return colors
+
+
+def compute_color_entropy(color_tokens: List[str]) -> float:
+    """Compute entropy of color distribution. Low entropy = mode collapse."""
+    if not color_tokens:
+        return 0.0
+    counts = Counter(color_tokens)
+    total = len(color_tokens)
+    probs = [count / total for count in counts.values()]
+    entropy = -sum(p * np.log2(p) for p in probs if p > 0)
+    return entropy
+
+
+class UICodeMetricsCallback(TrainerCallback):
+    """Custom callback to log UI-specific metrics during training."""
+    
+    def __init__(self, tokenizer, val_samples: Optional[List[Dict]] = None, log_every: int = 1):
+        self.tokenizer = tokenizer
+        self.val_samples = val_samples or []
+        self.log_every = log_every
+        
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Called when trainer logs metrics."""
+        if logs is None or state.global_step % self.log_every != 0:
+            return
+        
+        # Compute perplexity from loss
+        if "loss" in logs:
+            perplexity = np.exp(logs["loss"])
+            wandb.log({"train/perplexity": perplexity}, step=state.global_step)
+        
+        # Generate samples and compute UI metrics
+        if self.val_samples and kwargs.get("model") is not None:
+            model = kwargs["model"]
+            self._log_generation_metrics(model, state.global_step)
+    
+    def _log_generation_metrics(self, model, step: int):
+        """Generate samples and compute UI code metrics."""
+        model.eval()
+        
+        all_colors = []
+        all_classes = []
+        valid_syntax_count = 0
+        sample_generations = []
+        
+        # Generate from validation samples
+        num_samples = min(3, len(self.val_samples))  # Use 3 samples to save time
+        for i, sample in enumerate(self.val_samples[:num_samples]):
+            # Extract prompt and answer from raw sample
+            prompt_text = f"<|im_start|>user\n{sample.get('question', '')}<|im_end|>\n<|im_start|>assistant\n"
+            ground_truth = sample.get("answer", "")
+            
+            # Generate
+            inputs = self.tokenizer(prompt_text, return_tensors="pt").to(model.device)
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=256,  # Shorter for speed
+                    temperature=0.7,
+                    do_sample=True,
+                )
+            
+            generated = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            generated_code = generated[len(prompt_text):].strip()
+            
+            # Compute metrics
+            validator = HTMLValidator()
+            try:
+                validator.feed(generated_code)
+                is_valid = validator.is_valid()
+            except Exception:
+                is_valid = False
+            valid_syntax_count += int(is_valid)
+            
+            colors = extract_color_tokens(generated_code)
+            all_colors.extend(colors)
+            
+            classes = extract_tailwind_classes(generated_code)
+            all_classes.extend(classes)
+            
+            # Save for W&B table
+            sample_generations.append({
+                "step": step,
+                "sample": i,
+                "prompt": sample.get('question', '')[:80] + "...",
+                "generated_code": generated_code[:300] + "..." if len(generated_code) > 300 else generated_code,
+                "syntax_valid": "✓" if is_valid else "✗",
+                "num_colors": len(colors),
+                "num_classes": len(classes),
+            })
+        
+        # Aggregate metrics
+        syntax_validity_rate = valid_syntax_count / num_samples if num_samples > 0 else 0
+        color_entropy = compute_color_entropy(all_colors)
+        unique_classes = len(set(all_classes))
+        
+        # Log to W&B
+        wandb.log({
+            "eval/syntax_validity_rate": syntax_validity_rate,
+            "eval/color_entropy": color_entropy,
+            "eval/unique_tailwind_classes": unique_classes,
+            "eval/total_colors_used": len(all_colors),
+        }, step=step)
+        
+        # Log sample generations as table
+        if sample_generations:
+            wandb.log({
+                "eval/sample_generations": wandb.Table(
+                    columns=list(sample_generations[0].keys()),
+                    data=[list(s.values()) for s in sample_generations]
+                )
+            }, step=step)
+        
+        model.train()
+
+
+# ---------------------------------------------------------------------------
 # Persistent volumes
+# ---------------------------------------------------------------------------
 model_cache_vol = modal.Volume.from_name("uiux-model-cache", create_if_missing=True)
 data_vol = modal.Volume.from_name("uiux-training-data", create_if_missing=True)
 checkpoint_vol = modal.Volume.from_name("uiux-checkpoints", create_if_missing=True)
@@ -286,6 +456,17 @@ def finetune(config: TrainingConfig):
 
     print_mem("After data load")
 
+    # Load validation samples for UI metrics callback
+    val_samples_for_metrics = []
+    if val_dataset:
+        # Load raw validation samples (before tokenization) for generation
+        val_path = "/training_data/val.jsonl"
+        if os.path.exists(val_path):
+            with open(val_path, "r") as f:
+                raw_val = [json.loads(line) for line in f]
+                # Take first 5 samples for metrics
+                val_samples_for_metrics = raw_val[:5]
+
     # Create trainer
     print("Initializing SFTTrainer...")
     trainer = SFTTrainer(
@@ -298,6 +479,17 @@ def finetune(config: TrainingConfig):
         packing=False,
         args=training_args,
     )
+
+    # Add UI-specific metrics callback
+    if val_samples_for_metrics:
+        print("Adding UI code metrics callback...")
+        
+        ui_callback = UICodeMetricsCallback(
+            tokenizer=tokenizer,
+            val_samples=val_samples_for_metrics,
+            log_every=1  # Log UI metrics every step for visibility
+        )
+        trainer.add_callback(ui_callback)
 
     print(f"Training dataset: {len(train_dataset)} samples")
     if val_dataset:
