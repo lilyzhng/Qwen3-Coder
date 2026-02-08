@@ -5,12 +5,12 @@ Modify values here to adjust training parameters.
 
 # Model Configuration
 MODEL_NAME = "Qwen/Qwen3-Coder-Next-Base"
-MAX_SEQ_LENGTH = 4096
+MAX_SEQ_LENGTH = 1024
 LOAD_IN_4BIT = True
 
 # LoRA Configuration
-LORA_R = 16
-LORA_ALPHA = 32
+LORA_R = 8
+LORA_ALPHA = 16
 LORA_DROPOUT = 0.0
 
 # Training Hyperparameters
@@ -38,7 +38,7 @@ EVAL_STEPS = 2
 WANDB_PROJECT = "qwen3-coder-uiux"
 
 # UI Metrics
-UI_METRICS_ENABLED = True
+UI_METRICS_ENABLED = False
 UI_METRICS_LOG_EVERY = 1  # Log screenshots and metrics every N steps
 UI_METRICS_RENDER_SCREENSHOTS = True  # Enable Playwright visual rendering
 
