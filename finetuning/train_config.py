@@ -5,13 +5,14 @@ Modify values here to adjust training parameters.
 
 # Model Configuration
 MODEL_NAME = "Qwen/Qwen3-Coder-Next-Base"
-MAX_SEQ_LENGTH = 1024
+MAX_SEQ_LENGTH = 512
 LOAD_IN_4BIT = True
 
 # LoRA Configuration
 LORA_R = 8
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.0
+LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 # Training Hyperparameters
 LEARNING_RATE = 2e-4
@@ -19,7 +20,8 @@ NUM_EPOCHS = 1
 MAX_STEPS = 4  # Set to -1 to use NUM_EPOCHS instead
 BATCH_SIZE = 1
 GRADIENT_ACCUMULATION_STEPS = 8
-GRADIENT_CHECKPOINTING = True  # MANDATORY for 80B MoE - even H200 OOMs without it
+GRADIENT_CHECKPOINTING = False  # MANDATORY for 80B MoE - even H200 OOMs without it
+USE_CACHE = False  # Disable KV cache during training to save memory
 WARMUP_RATIO = 0.06
 WEIGHT_DECAY = 0.01
 LR_SCHEDULER_TYPE = "cosine"
