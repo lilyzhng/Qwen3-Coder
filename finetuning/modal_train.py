@@ -307,9 +307,8 @@ model_cache_vol = modal.Volume.from_name("uiux-model-cache", create_if_missing=T
 data_vol = modal.Volume.from_name("uiux-training-data", create_if_missing=True)
 checkpoint_vol = modal.Volume.from_name("uiux-checkpoints", create_if_missing=True)
 
-# GPU — H200 needed for training (batch_size=1, grad_accum=8, seq_len=4096)
-GPU_TYPE = "A100-80GB"
-TIMEOUT_HOURS = 6  # Increased: full training needs ~4-5 hours with gradient offloading
+# GPU — Will be set dynamically based on config
+TIMEOUT_HOURS = 6
 MAX_RETRIES = 1
 
 # LoRA target modules — all linear layers for best quality
@@ -340,6 +339,7 @@ class TrainingConfig:
     max_steps: int = 4  # Set to -1 to use num_epochs
     batch_size: int = 1
     gradient_accumulation_steps: int = 8
+    gradient_checkpointing: bool = True  # MANDATORY for 80B MoE
     warmup_ratio: float = 0.06
     weight_decay: float = 0.01
     lr_scheduler_type: str = "cosine"
@@ -357,6 +357,9 @@ class TrainingConfig:
     ui_metrics_enabled: bool = True
     ui_metrics_log_every: int = 1  # Log screenshots and UI metrics every N steps
     ui_metrics_render_screenshots: bool = True  # Enable Playwright visual rendering
+
+    # Hardware
+    gpu_type: str = "H100"  # A100, H100, or H200
 
     # Experiment
     seed: int = 42
@@ -389,6 +392,7 @@ def load_config_from_file() -> dict:
             "max_steps": cfg.MAX_STEPS,
             "batch_size": cfg.BATCH_SIZE,
             "gradient_accumulation_steps": cfg.GRADIENT_ACCUMULATION_STEPS,
+            "gradient_checkpointing": cfg.GRADIENT_CHECKPOINTING,
             "warmup_ratio": cfg.WARMUP_RATIO,
             "weight_decay": cfg.WEIGHT_DECAY,
             "lr_scheduler_type": cfg.LR_SCHEDULER_TYPE,
@@ -400,6 +404,7 @@ def load_config_from_file() -> dict:
             "ui_metrics_enabled": cfg.UI_METRICS_ENABLED,
             "ui_metrics_log_every": cfg.UI_METRICS_LOG_EVERY,
             "ui_metrics_render_screenshots": cfg.UI_METRICS_RENDER_SCREENSHOTS,
+            "gpu_type": cfg.GPU_TYPE,
         }
     except Exception as e:
         print(f"⚠️  Error loading config: {e}, using defaults")
@@ -452,21 +457,32 @@ def load_training_data(tokenizer, train_size: int = 100, val_size: int = 10):
 
 
 # ---------------------------------------------------------------------------
-# Main Training Function
+# Main Training Function - Single function with dynamic GPU selection
 # ---------------------------------------------------------------------------
-@app.function(
-    image=train_image,
-    gpu=GPU_TYPE,
-    volumes={
-        "/model_cache": model_cache_vol,
-        "/training_data": data_vol,
-        "/checkpoints": checkpoint_vol,
-    },
-    secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
-    timeout=TIMEOUT_HOURS * 60 * 60,
-    retries=modal.Retries(initial_delay=0.0, max_retries=MAX_RETRIES),
-)
-def finetune(config: TrainingConfig):
+# Create separate functions for each GPU type (required by Modal's decorator system)
+_gpu_functions = {}
+
+for gpu_name, gpu_spec in [("A100", "A100-80GB"), ("H100", "H100"), ("H200", "H200")]:
+    @app.function(
+        image=train_image,
+        gpu=gpu_spec,
+        volumes={
+            "/model_cache": model_cache_vol,
+            "/training_data": data_vol,
+            "/checkpoints": checkpoint_vol,
+        },
+        secrets=[modal.Secret.from_name("wandb-secret"), modal.Secret.from_name("hf-secret")],
+        timeout=TIMEOUT_HOURS * 60 * 60,
+        retries=modal.Retries(initial_delay=0.0, max_retries=MAX_RETRIES),
+    )
+    def finetune(config: TrainingConfig):
+        """Run QLoRA fine-tuning with Unsloth."""
+        return _finetune_impl(config)
+    
+    _gpu_functions[gpu_name] = finetune
+
+
+def _finetune_impl(config: TrainingConfig):
     """Run QLoRA fine-tuning on Modal with Unsloth on A100 80GB."""
 
     # Initialize W&B
@@ -490,6 +506,7 @@ def finetune(config: TrainingConfig):
     print(f"    - Grad accum: {config.gradient_accumulation_steps}")
     print(f"    - Effective batch: {config.batch_size * config.gradient_accumulation_steps}")
     print(f"    - Max seq length: {config.max_seq_length}")
+    print(f"    - Gradient checkpointing: {config.gradient_checkpointing}")
     print(f"  Data:")
     print(f"    - Train size: {config.train_size}")
     print(f"    - Val size: {config.val_size}")
@@ -501,6 +518,8 @@ def finetune(config: TrainingConfig):
     print(f"    - Enabled: {config.ui_metrics_enabled}")
     print(f"    - Log every: {config.ui_metrics_log_every} steps")
     print(f"    - Render screenshots: {config.ui_metrics_render_screenshots}")
+    print(f"  Hardware:")
+    print(f"    - GPU: {config.gpu_type}")
     print("="*60 + "\n")
 
     # Print GPU and CPU memory info
@@ -591,7 +610,7 @@ def finetune(config: TrainingConfig):
     training_args = TrainingArguments(
         per_device_train_batch_size=config.batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
-        gradient_checkpointing=True,  # Save memory by recomputing activations
+        gradient_checkpointing=config.gradient_checkpointing,  # Configurable
         learning_rate=config.learning_rate,
         num_train_epochs=config.num_epochs,
         max_steps=config.max_steps if config.max_steps > 0 else -1,
@@ -761,18 +780,25 @@ def main(
     # Create TrainingConfig from merged config
     config = TrainingConfig(**config_dict)
 
-    print("Launching fine-tuning on Modal (A100 80GB)")
+    print("Launching fine-tuning on Modal")
+    print(f"  GPU: {config.gpu_type}")
     print(f"  Model: {config.model_name}")
     print(f"  LoRA: r={config.lora_r}, alpha={config.lora_alpha}")
     print(f"  Batch size: {config.batch_size}, Grad accum: {config.gradient_accumulation_steps}")
     print(f"  Effective batch: {config.batch_size * config.gradient_accumulation_steps}")
     print(f"  Seq length: {config.max_seq_length}")
+    print(f"  Gradient checkpointing: {config.gradient_checkpointing}")
     print(f"  Epochs: {config.num_epochs}, Max steps: {config.max_steps}")
     print(f"  Train size: {config.train_size}, Val size: {config.val_size}")
     print(f"  UI Metrics: enabled={config.ui_metrics_enabled}, log_every={config.ui_metrics_log_every}")
     print(f"  Experiment: {config.experiment_name}")
     print()
 
-    experiment = finetune.remote(config)
+    # Dispatch to the appropriate GPU-specific function
+    if config.gpu_type not in _gpu_functions:
+        raise ValueError(f"Unknown GPU type: {config.gpu_type}. Must be A100, H100, or H200")
+    
+    experiment = _gpu_functions[config.gpu_type].remote(config)
+    
     print(f"\nDone! Experiment: {experiment}")
     print(f"Download adapter: modal volume get uiux-checkpoints /experiments/{experiment}/final_model ./lora_adapter/")

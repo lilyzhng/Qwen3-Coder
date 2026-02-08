@@ -19,7 +19,7 @@ NUM_EPOCHS = 1
 MAX_STEPS = 4  # Set to -1 to use NUM_EPOCHS instead
 BATCH_SIZE = 1
 GRADIENT_ACCUMULATION_STEPS = 8
-GRADIENT_CHECKPOINTING = True
+GRADIENT_CHECKPOINTING = True  # MANDATORY for 80B MoE - even H200 OOMs without it
 WARMUP_RATIO = 0.06
 WEIGHT_DECAY = 0.01
 LR_SCHEDULER_TYPE = "cosine"
@@ -43,7 +43,7 @@ UI_METRICS_LOG_EVERY = 1  # Log screenshots and metrics every N steps
 UI_METRICS_RENDER_SCREENSHOTS = True  # Enable Playwright visual rendering
 
 # Hardware & Infrastructure
-GPU_TYPE = "A100"  # A100, H100, or H200
+GPU_TYPE = "H200"  # A100, H100, or H200
 TIMEOUT_HOURS = 6
 MAX_RETRIES = 0
 
