@@ -326,7 +326,7 @@ LORA_TARGET_MODULES = [
 class TrainingConfig:
     # Model
     model_name: str = "Qwen/Qwen3-Coder-Next-Base"
-    max_seq_length: int = 4096  # Reduced from 8192 to save memory
+    max_seq_length: int = 4096
     load_in_4bit: bool = True
 
     # LoRA
@@ -336,18 +336,27 @@ class TrainingConfig:
 
     # Training
     learning_rate: float = 2e-4
-    num_epochs: int = 3
-    max_steps: int = -1  # -1 means use num_epochs
-    batch_size: int = 1  # Reduced from 2 to save memory
-    gradient_accumulation_steps: int = 8  # Increased to maintain effective batch size
+    num_epochs: int = 1
+    max_steps: int = 4  # Set to -1 to use num_epochs
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 8
     warmup_ratio: float = 0.06
     weight_decay: float = 0.01
     lr_scheduler_type: str = "cosine"
 
+    # Data
+    train_size: int = 32  # Number of training samples to load
+    val_size: int = 10  # Number of validation samples to load
+
     # Logging
     logging_steps: int = 1
-    save_steps: int = 50
-    eval_steps: int = 25
+    save_steps: int = 4
+    eval_steps: int = 2
+    
+    # UI Metrics
+    ui_metrics_enabled: bool = True
+    ui_metrics_log_every: int = 1  # Log screenshots and UI metrics every N steps
+    ui_metrics_render_screenshots: bool = True  # Enable Playwright visual rendering
 
     # Experiment
     seed: int = 42
@@ -360,36 +369,38 @@ class TrainingConfig:
             self.experiment_name = f"{model_short}-r{self.lora_r}-{timestamp}"
 
 
-def load_config_from_yaml(yaml_path: str = "finetuning/train_config.yaml") -> dict:
-    """Load training configuration from YAML file."""
+def load_config_from_file() -> dict:
+    """Load training configuration from Python config file."""
     try:
-        with open(yaml_path, 'r') as f:
-            config_data = yaml.safe_load(f)
+        # Import the config module
+        import sys
+        sys.path.insert(0, "/Users/lilyzhang/Desktop/Qwen3-Coder/finetuning")
+        import train_config as cfg
         
-        # Flatten nested structure for TrainingConfig
-        flat_config = {
-            "model_name": config_data['model']['name'],
-            "max_seq_length": config_data['model']['max_seq_length'],
-            "load_in_4bit": config_data['model']['load_in_4bit'],
-            "lora_r": config_data['lora']['r'],
-            "lora_alpha": config_data['lora']['alpha'],
-            "lora_dropout": config_data['lora']['dropout'],
-            "learning_rate": config_data['training']['learning_rate'],
-            "num_epochs": config_data['training']['num_epochs'],
-            "max_steps": config_data['training']['max_steps'],
-            "batch_size": config_data['training']['batch_size'],
-            "gradient_accumulation_steps": config_data['training']['gradient_accumulation_steps'],
-            "warmup_ratio": config_data['training']['warmup_ratio'],
-            "weight_decay": config_data['training']['weight_decay'],
-            "lr_scheduler_type": config_data['training']['lr_scheduler_type'],
-            "logging_steps": config_data['logging']['logging_steps'],
-            "save_steps": config_data['logging']['save_steps'],
-            "eval_steps": config_data['logging']['eval_steps'],
+        return {
+            "model_name": cfg.MODEL_NAME,
+            "max_seq_length": cfg.MAX_SEQ_LENGTH,
+            "load_in_4bit": cfg.LOAD_IN_4BIT,
+            "lora_r": cfg.LORA_R,
+            "lora_alpha": cfg.LORA_ALPHA,
+            "lora_dropout": cfg.LORA_DROPOUT,
+            "learning_rate": cfg.LEARNING_RATE,
+            "num_epochs": cfg.NUM_EPOCHS,
+            "max_steps": cfg.MAX_STEPS,
+            "batch_size": cfg.BATCH_SIZE,
+            "gradient_accumulation_steps": cfg.GRADIENT_ACCUMULATION_STEPS,
+            "warmup_ratio": cfg.WARMUP_RATIO,
+            "weight_decay": cfg.WEIGHT_DECAY,
+            "lr_scheduler_type": cfg.LR_SCHEDULER_TYPE,
+            "train_size": cfg.TRAIN_SIZE,
+            "val_size": cfg.VAL_SIZE,
+            "logging_steps": cfg.LOGGING_STEPS,
+            "save_steps": cfg.SAVE_STEPS,
+            "eval_steps": cfg.EVAL_STEPS,
+            "ui_metrics_enabled": cfg.UI_METRICS_ENABLED,
+            "ui_metrics_log_every": cfg.UI_METRICS_LOG_EVERY,
+            "ui_metrics_render_screenshots": cfg.UI_METRICS_RENDER_SCREENSHOTS,
         }
-        return flat_config
-    except FileNotFoundError:
-        print(f"⚠️  Config file not found at {yaml_path}, using defaults")
-        return {}
     except Exception as e:
         print(f"⚠️  Error loading config: {e}, using defaults")
         return {}
@@ -398,18 +409,20 @@ def load_config_from_yaml(yaml_path: str = "finetuning/train_config.yaml") -> di
 # ---------------------------------------------------------------------------
 # Data Loading
 # ---------------------------------------------------------------------------
-def load_training_data(tokenizer):
+def load_training_data(tokenizer, train_size: int = 100, val_size: int = 10):
     """Load ChatML JSONL data from the Modal volume and format for SFTTrainer."""
     train_path = "/training_data/data/uigen_train.jsonl"
     val_path = "/training_data/data/uigen_val.jsonl"
 
-    def read_jsonl(path):
+    def read_jsonl(path, limit: int = None):
         samples = []
         with open(path, "r") as f:
             for line in f:
                 line = line.strip()
                 if line:
                     samples.append(json.loads(line))
+                    if limit and len(samples) >= limit:
+                        break
         return samples
 
     def format_samples(samples):
@@ -424,15 +437,15 @@ def load_training_data(tokenizer):
             texts.append(text)
         return Dataset.from_dict({"text": texts})
 
-    train_samples = read_jsonl(train_path)
-    print(f"Loaded {len(train_samples)} training samples")
+    train_samples = read_jsonl(train_path, limit=train_size)
+    print(f"Loaded {len(train_samples)} training samples (limit: {train_size})")
 
     train_dataset = format_samples(train_samples)
 
     val_dataset = None
     if os.path.exists(val_path):
-        val_samples = read_jsonl(val_path)
-        print(f"Loaded {len(val_samples)} validation samples")
+        val_samples = read_jsonl(val_path, limit=val_size)
+        print(f"Loaded {len(val_samples)} validation samples (limit: {val_size})")
         val_dataset = format_samples(val_samples)
 
     return train_dataset, val_dataset
@@ -463,6 +476,32 @@ def finetune(config: TrainingConfig):
         config=config.__dict__,
     )
     print(f"W&B run: {wandb.run.url}")
+    
+    # Print config that was logged to W&B
+    print("\n" + "="*60)
+    print("📝 Config logged to W&B:")
+    print("="*60)
+    print(f"  Model: {config.model_name}")
+    print(f"  LoRA: r={config.lora_r}, alpha={config.lora_alpha}")
+    print(f"  Training:")
+    print(f"    - Learning rate: {config.learning_rate}")
+    print(f"    - Epochs: {config.num_epochs}, Max steps: {config.max_steps}")
+    print(f"    - Batch size: {config.batch_size}")
+    print(f"    - Grad accum: {config.gradient_accumulation_steps}")
+    print(f"    - Effective batch: {config.batch_size * config.gradient_accumulation_steps}")
+    print(f"    - Max seq length: {config.max_seq_length}")
+    print(f"  Data:")
+    print(f"    - Train size: {config.train_size}")
+    print(f"    - Val size: {config.val_size}")
+    print(f"  Logging:")
+    print(f"    - Logging steps: {config.logging_steps}")
+    print(f"    - Save steps: {config.save_steps}")
+    print(f"    - Eval steps: {config.eval_steps}")
+    print(f"  UI Metrics:")
+    print(f"    - Enabled: {config.ui_metrics_enabled}")
+    print(f"    - Log every: {config.ui_metrics_log_every} steps")
+    print(f"    - Render screenshots: {config.ui_metrics_render_screenshots}")
+    print("="*60 + "\n")
 
     # Print GPU and CPU memory info
     n_gpus = torch.cuda.device_count()
@@ -537,8 +576,12 @@ def finetune(config: TrainingConfig):
     print_mem("After LoRA setup")
 
     # Load data
-    print("Loading training data...")
-    train_dataset, val_dataset = load_training_data(tokenizer)
+    print(f"Loading training data (train_size={config.train_size}, val_size={config.val_size})...")
+    train_dataset, val_dataset = load_training_data(
+        tokenizer,
+        train_size=config.train_size,
+        val_size=config.val_size
+    )
 
     # Checkpoint directory
     checkpoint_path = f"/checkpoints/experiments/{config.experiment_name}"
@@ -574,12 +617,19 @@ def finetune(config: TrainingConfig):
     val_samples_for_metrics = []
     if val_dataset:
         # Load raw validation samples (before tokenization) for generation
-        val_path = "/training_data/val.jsonl"
+        val_path = "/training_data/data/uigen_val.jsonl"
         if os.path.exists(val_path):
             with open(val_path, "r") as f:
-                raw_val = [json.loads(line) for line in f]
-                # Take first 5 samples for metrics
-                val_samples_for_metrics = raw_val[:5]
+                raw_val = []
+                for i, line in enumerate(f):
+                    if i >= config.val_size:  # Match the val_size limit
+                        break
+                    line = line.strip()
+                    if line:
+                        raw_val.append(json.loads(line))
+                # Take first 5 samples for metrics (or all if less than 5)
+                val_samples_for_metrics = raw_val[:min(5, len(raw_val))]
+                print(f"Loaded {len(val_samples_for_metrics)} validation samples for UI metrics")
 
     # Create trainer
     print("Initializing SFTTrainer...")
@@ -595,15 +645,17 @@ def finetune(config: TrainingConfig):
     )
 
     # Add UI-specific metrics callback
-    if val_samples_for_metrics:
-        print("Adding UI code metrics callback...")
+    if config.ui_metrics_enabled and val_samples_for_metrics:
+        print(f"Adding UI code metrics callback (log_every={config.ui_metrics_log_every}, screenshots={config.ui_metrics_render_screenshots})...")
         
         ui_callback = UICodeMetricsCallback(
             tokenizer=tokenizer,
             val_samples=val_samples_for_metrics,
-            log_every=1  # Log UI metrics every step for visibility
+            log_every=config.ui_metrics_log_every
         )
         trainer.add_callback(ui_callback)
+    elif not val_samples_for_metrics:
+        print("⚠️  No validation samples found, skipping UI metrics callback")
 
     print(f"Training dataset: {len(train_dataset)} samples")
     if val_dataset:
@@ -659,7 +711,7 @@ def finetune(config: TrainingConfig):
 # ---------------------------------------------------------------------------
 @app.local_entrypoint()
 def main(
-    config_file: str = "finetuning/train_config.yaml",
+    config_file: str = "finetuning/train_config.py",
     model_name: str = None,
     max_steps: int = None,
     num_epochs: int = None,
@@ -674,15 +726,15 @@ def main(
     """
     Launch fine-tuning on Modal.
     
-    Loads config from YAML file, then applies CLI overrides.
+    Loads config from Python file, then applies CLI overrides.
     Example: modal run finetuning/modal_train.py --max-steps 5 --batch-size 2
     """
-    # Load config from YAML
+    # Load config from Python file
     print(f"Loading config from {config_file}...")
-    yaml_config = load_config_from_yaml(config_file)
+    file_config = load_config_from_file()
     
-    # Start with YAML config, then apply CLI overrides
-    config_dict = {**yaml_config}  # Start with YAML values
+    # Start with file config, then apply CLI overrides
+    config_dict = {**file_config}  # Start with file values
     
     # Override with CLI args if provided
     if model_name is not None:
@@ -716,6 +768,8 @@ def main(
     print(f"  Effective batch: {config.batch_size * config.gradient_accumulation_steps}")
     print(f"  Seq length: {config.max_seq_length}")
     print(f"  Epochs: {config.num_epochs}, Max steps: {config.max_steps}")
+    print(f"  Train size: {config.train_size}, Val size: {config.val_size}")
+    print(f"  UI Metrics: enabled={config.ui_metrics_enabled}, log_every={config.ui_metrics_log_every}")
     print(f"  Experiment: {config.experiment_name}")
     print()
 
