@@ -61,7 +61,7 @@ with train_image.imports():
     from transformers import TrainingArguments
     from trl import SFTTrainer
     from unsloth import FastLanguageModel
-    from ui_metrics import UICodeMetricsCallback
+    # from ui_metrics import UICodeMetricsCallback
 
 # ---------------------------------------------------------------------------
 # Persistent volumes
@@ -429,7 +429,9 @@ def _finetune_impl(config: TrainingConfig):
     # Add UI-specific metrics callback
     if config.ui_metrics_enabled and val_samples_for_metrics:
         print(f"Adding UI code metrics callback (log_every={config.ui_metrics_log_every}, screenshots={config.ui_metrics_render_screenshots})...")
-        
+
+        from ui_metrics import UICodeMetricsCallback
+
         ui_callback = UICodeMetricsCallback(
             tokenizer=tokenizer,
             val_samples=val_samples_for_metrics,
