@@ -58,9 +58,8 @@ model_cache_vol = modal.Volume.from_name("uiux-model-cache", create_if_missing=T
 data_vol = modal.Volume.from_name("uiux-training-data", create_if_missing=True)
 checkpoint_vol = modal.Volume.from_name("uiux-checkpoints", create_if_missing=True)
 
-# GPU — single H200 (141GB VRAM): Unsloth's optimized loading uses less peak
-# memory than vanilla transformers+BnB. Hopper arch is fully supported.
-GPU_TYPE = "H200"
+# GPU — H200 needed for training (batch_size=1, grad_accum=8, seq_len=4096)
+GPU_TYPE = "A100-80GB"
 TIMEOUT_HOURS = 1
 MAX_RETRIES = 1
 
@@ -78,7 +77,7 @@ LORA_TARGET_MODULES = [
 class TrainingConfig:
     # Model
     model_name: str = "Qwen/Qwen3-Coder-Next-Base"
-    max_seq_length: int = 8192
+    max_seq_length: int = 4096  # Reduced from 8192 to save memory
     load_in_4bit: bool = True
 
     # LoRA
@@ -90,8 +89,8 @@ class TrainingConfig:
     learning_rate: float = 2e-4
     num_epochs: int = 3
     max_steps: int = -1  # -1 means use num_epochs
-    batch_size: int = 2
-    gradient_accumulation_steps: int = 4
+    batch_size: int = 1  # Reduced from 2 to save memory
+    gradient_accumulation_steps: int = 8  # Increased to maintain effective batch size
     warmup_ratio: float = 0.06
     weight_decay: float = 0.01
     lr_scheduler_type: str = "cosine"
@@ -171,7 +170,7 @@ def load_training_data(tokenizer):
     retries=modal.Retries(initial_delay=0.0, max_retries=MAX_RETRIES),
 )
 def finetune(config: TrainingConfig):
-    """Run QLoRA fine-tuning on Modal with Unsloth on an H200 (141GB)."""
+    """Run QLoRA fine-tuning on Modal with Unsloth on A100 80GB."""
 
     # Initialize W&B
     wandb.init(
@@ -218,16 +217,12 @@ def finetune(config: TrainingConfig):
     print_mem("Before model load")
 
     # Load model with Unsloth (handles 4-bit quantization efficiently)
-    # max_memory set to 200GiB to prevent accelerate from estimating bf16 size
-    # (160GB) > actual GPU (141GB) and offloading to CPU. The actual 4-bit model
-    # only uses ~45-60GB so it fits fine on the H200.
     print(f"Loading model: {config.model_name} (4-bit via Unsloth)...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=config.model_name,
         max_seq_length=config.max_seq_length,
         dtype=None,
         load_in_4bit=config.load_in_4bit,
-        max_memory={0: "200GiB", "cpu": "0GiB"},
     )
 
     print_mem("After model load")
@@ -269,6 +264,7 @@ def finetune(config: TrainingConfig):
     training_args = TrainingArguments(
         per_device_train_batch_size=config.batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
+        gradient_checkpointing=True,  # Save memory by recomputing activations
         learning_rate=config.learning_rate,
         num_train_epochs=config.num_epochs,
         max_steps=config.max_steps if config.max_steps > 0 else -1,
@@ -381,7 +377,7 @@ def main(
         experiment_name=experiment_name,
     )
 
-    print("Launching fine-tuning on Modal (H200 141GB)")
+    print("Launching fine-tuning on Modal (A100 80GB)")
     print(f"  Model: {config.model_name}")
     print(f"  LoRA: r={config.lora_r}, alpha={config.lora_alpha}")
     print(f"  Epochs: {config.num_epochs}, Max steps: {config.max_steps}")
