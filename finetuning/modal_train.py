@@ -34,6 +34,11 @@ train_image = (
         "hf-transfer",
         "wandb",
         "numpy",  # For entropy calculations
+        "playwright",  # For rendering screenshots
+        "pyyaml",  # For loading config file
+    )
+    .run_commands(
+        "playwright install --with-deps chromium"  # Install browser for screenshots
     )
     .env({
         "HF_HOME": "/model_cache",
@@ -44,116 +49,153 @@ train_image = (
 with train_image.imports():
     import unsloth  # noqa: F401 — must be first for patches
 
+    import base64
     import json
     import os
     import re
+    import yaml
     from collections import Counter
     from html.parser import HTMLParser
+    from io import BytesIO
     from typing import Dict, List, Optional
 
     import numpy as np
     import torch
     import wandb
     from datasets import Dataset
+    from playwright.sync_api import sync_playwright
     from transformers import TrainerCallback, TrainingArguments
     from trl import SFTTrainer
     from unsloth import FastLanguageModel
 
-
-# ---------------------------------------------------------------------------
-# UI Code Metrics (SFT Monitoring)
-# ---------------------------------------------------------------------------
-class HTMLValidator(HTMLParser):
-    """Lightweight HTML validator to check syntax."""
+    # ---------------------------------------------------------------------------
+    # UI Code Metrics (SFT Monitoring)
+    # ---------------------------------------------------------------------------
     
-    def __init__(self):
-        super().__init__()
-        self.errors = []
-        self.tag_stack = []
-        
-    def handle_starttag(self, tag, attrs):
-        self.tag_stack.append(tag)
-        
-    def handle_endtag(self, tag):
-        if not self.tag_stack:
-            self.errors.append(f"Unexpected closing tag: </{tag}>")
-        elif self.tag_stack[-1] == tag:
-            self.tag_stack.pop()
-        else:
-            self.errors.append(f"Tag mismatch: expected </{self.tag_stack[-1]}>, got </{tag}>")
+    HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <title>UI Preview</title>
+</head>
+<body>
+{content}
+</body>
+</html>
+"""
+
+    def render_html_screenshot(html_code: str) -> Optional[bytes]:
+        """Render HTML and capture screenshot using Playwright."""
+        try:
+            # Wrap code in full HTML template with Tailwind CDN
+            full_html = HTML_TEMPLATE.format(content=html_code)
             
-    def is_valid(self):
-        return len(self.errors) == 0 and len(self.tag_stack) == 0
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"width": 1280, "height": 800})
+                page.set_content(full_html)
+                page.wait_for_timeout(1000)  # Wait for Tailwind to load
+                screenshot_bytes = page.screenshot(full_page=True)
+                browser.close()
+                return screenshot_bytes
+        except Exception as e:
+            print(f"Screenshot render error: {e}")
+            return None
 
-
-def extract_tailwind_classes(code: str) -> List[str]:
-    """Extract Tailwind CSS classes from HTML/JSX code."""
-    class_patterns = [r'className=["\'](.*?)["\']', r'class=["\'](.*?)["\']']
-    classes = []
-    for pattern in class_patterns:
-        matches = re.findall(pattern, code)
-        for match in matches:
-            classes.extend(match.split())
-    return classes
-
-
-def extract_color_tokens(code: str) -> List[str]:
-    """Extract color-related tokens (Tailwind colors and hex codes)."""
-    colors = []
-    tailwind_colors = re.findall(r'\b(?:bg|text|border)-(\w+)-\d+\b', code)
-    colors.extend(tailwind_colors)
-    hex_colors = re.findall(r'#[0-9a-fA-F]{3,6}\b', code)
-    colors.extend(hex_colors)
-    return colors
-
-
-def compute_color_entropy(color_tokens: List[str]) -> float:
-    """Compute entropy of color distribution. Low entropy = mode collapse."""
-    if not color_tokens:
-        return 0.0
-    counts = Counter(color_tokens)
-    total = len(color_tokens)
-    probs = [count / total for count in counts.values()]
-    entropy = -sum(p * np.log2(p) for p in probs if p > 0)
-    return entropy
-
-
-class UICodeMetricsCallback(TrainerCallback):
-    """Custom callback to log UI-specific metrics during training."""
     
-    def __init__(self, tokenizer, val_samples: Optional[List[Dict]] = None, log_every: int = 1):
-        self.tokenizer = tokenizer
-        self.val_samples = val_samples or []
-        self.log_every = log_every
+    class HTMLValidator(HTMLParser):
+        """Lightweight HTML validator to check syntax."""
         
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        """Called when trainer logs metrics."""
-        if logs is None or state.global_step % self.log_every != 0:
-            return
+        def __init__(self):
+            super().__init__()
+            self.errors = []
+            self.tag_stack = []
+            
+        def handle_starttag(self, tag, attrs):
+            self.tag_stack.append(tag)
+            
+        def handle_endtag(self, tag):
+            if not self.tag_stack:
+                self.errors.append(f"Unexpected closing tag: </{tag}>")
+            elif self.tag_stack[-1] == tag:
+                self.tag_stack.pop()
+            else:
+                self.errors.append(f"Tag mismatch: expected </{self.tag_stack[-1]}>, got </{tag}>")
+                
+        def is_valid(self):
+            return len(self.errors) == 0 and len(self.tag_stack) == 0
+
+
+    def extract_tailwind_classes(code: str) -> List[str]:
+        """Extract Tailwind CSS classes from HTML/JSX code."""
+        class_patterns = [r'className=["\'](.*?)["\']', r'class=["\'](.*?)["\']']
+        classes = []
+        for pattern in class_patterns:
+            matches = re.findall(pattern, code)
+            for match in matches:
+                classes.extend(match.split())
+        return classes
+
+
+    def extract_color_tokens(code: str) -> List[str]:
+        """Extract color-related tokens (Tailwind colors and hex codes)."""
+        colors = []
+        tailwind_colors = re.findall(r'\b(?:bg|text|border)-(\w+)-\d+\b', code)
+        colors.extend(tailwind_colors)
+        hex_colors = re.findall(r'#[0-9a-fA-F]{3,6}\b', code)
+        colors.extend(hex_colors)
+        return colors
+
+
+    def compute_color_entropy(color_tokens: List[str]) -> float:
+        """Compute entropy of color distribution. Low entropy = mode collapse."""
+        if not color_tokens:
+            return 0.0
+        counts = Counter(color_tokens)
+        total = len(color_tokens)
+        probs = [count / total for count in counts.values()]
+        entropy = -sum(p * np.log2(p) for p in probs if p > 0)
+        return entropy
+
+
+    class UICodeMetricsCallback(TrainerCallback):
+        """Custom callback to log UI-specific metrics during training."""
         
-        # Compute perplexity from loss
-        if "loss" in logs:
-            perplexity = np.exp(logs["loss"])
-            wandb.log({"train/perplexity": perplexity}, step=state.global_step)
+        def __init__(self, tokenizer, val_samples: Optional[List[Dict]] = None, log_every: int = 1):
+            self.tokenizer = tokenizer
+            self.val_samples = val_samples or []
+            self.log_every = log_every
+            
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            """Called when trainer logs metrics."""
+            if logs is None or state.global_step % self.log_every != 0:
+                return
+            
+            # Compute perplexity from loss
+            if "loss" in logs:
+                perplexity = np.exp(logs["loss"])
+                wandb.log({"train/perplexity": perplexity}, step=state.global_step)
+            
+            # Generate samples and compute UI metrics
+            if self.val_samples and kwargs.get("model") is not None:
+                model = kwargs["model"]
+                self._log_generation_metrics(model, state.global_step)
         
-        # Generate samples and compute UI metrics
-        if self.val_samples and kwargs.get("model") is not None:
-            model = kwargs["model"]
-            self._log_generation_metrics(model, state.global_step)
-    
-    def _log_generation_metrics(self, model, step: int):
-        """Generate samples and compute UI code metrics."""
-        model.eval()
-        
-        all_colors = []
-        all_classes = []
-        valid_syntax_count = 0
-        sample_generations = []
-        
-        # Generate from validation samples
-        num_samples = min(3, len(self.val_samples))  # Use 3 samples to save time
-        for i, sample in enumerate(self.val_samples[:num_samples]):
-            # Extract prompt and answer from raw sample
+        def _log_generation_metrics(self, model, step: int):
+            """Generate samples and compute UI code metrics with visual rendering."""
+            model.eval()
+            
+            all_colors = []
+            all_classes = []
+            valid_syntax_count = 0
+            sample_generations = []
+            visual_comparisons = []
+            
+            # Generate from first validation sample only (to save time during training)
+            sample = self.val_samples[0]
             prompt_text = f"<|im_start|>user\n{sample.get('question', '')}<|im_end|>\n<|im_start|>assistant\n"
             ground_truth = sample.get("answer", "")
             
@@ -162,7 +204,7 @@ class UICodeMetricsCallback(TrainerCallback):
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs,
-                    max_new_tokens=256,  # Shorter for speed
+                    max_new_tokens=512,  # Longer for better UI generation
                     temperature=0.7,
                     do_sample=True,
                 )
@@ -185,40 +227,77 @@ class UICodeMetricsCallback(TrainerCallback):
             classes = extract_tailwind_classes(generated_code)
             all_classes.extend(classes)
             
+            # Render screenshots
+            gen_screenshot = render_html_screenshot(generated_code)
+            gt_screenshot = render_html_screenshot(ground_truth)
+            
+            # Create visual comparison card if screenshots rendered successfully
+            if gen_screenshot and gt_screenshot:
+                gen_b64 = base64.b64encode(gen_screenshot).decode('utf-8')
+                gt_b64 = base64.b64encode(gt_screenshot).decode('utf-8')
+                
+                comparison_html = f"""
+<div style="font-family: system-ui, sans-serif; width: 100%; margin: 20px 0;">
+  <div style="background: #f8f9fa; border-radius: 8px; padding: 16px; margin-bottom: 16px;">
+    <div style="font-size: 14px; color: #666; margin-bottom: 4px;">Step {step}</div>
+    <div style="font-size: 16px; font-weight: 600; color: #1a1a1a;">{sample.get('question', '')[:100]}...</div>
+  </div>
+  <div style="display: flex; gap: 16px; width: 100%;">
+    <div style="flex: 1;">
+      <div style="font-size: 14px; font-weight: 600; color: #e74c3c; margin-bottom: 8px;">GENERATED (Step {step})</div>
+      <img src="data:image/png;base64,{gen_b64}" style="width: 100%; height: auto; border: 2px solid #e74c3c; border-radius: 6px;" />
+      <div style="margin-top: 8px; font-size: 12px; color: #666;">
+        ✓ Valid: {is_valid} | Colors: {len(colors)} | Classes: {len(classes)}
+      </div>
+    </div>
+    <div style="flex: 1;">
+      <div style="font-size: 14px; font-weight: 600; color: #27ae60; margin-bottom: 8px;">GROUND TRUTH</div>
+      <img src="data:image/png;base64,{gt_b64}" style="width: 100%; height: auto; border: 2px solid #27ae60; border-radius: 6px;" />
+    </div>
+  </div>
+</div>
+"""
+                visual_comparisons.append(comparison_html)
+            
             # Save for W&B table
             sample_generations.append({
                 "step": step,
-                "sample": i,
-                "prompt": sample.get('question', '')[:80] + "...",
-                "generated_code": generated_code[:300] + "..." if len(generated_code) > 300 else generated_code,
+                "prompt": sample.get('question', '')[:100] + "...",
+                "generated_code": generated_code[:400] + "..." if len(generated_code) > 400 else generated_code,
                 "syntax_valid": "✓" if is_valid else "✗",
                 "num_colors": len(colors),
                 "num_classes": len(classes),
             })
-        
-        # Aggregate metrics
-        syntax_validity_rate = valid_syntax_count / num_samples if num_samples > 0 else 0
-        color_entropy = compute_color_entropy(all_colors)
-        unique_classes = len(set(all_classes))
-        
-        # Log to W&B
-        wandb.log({
-            "eval/syntax_validity_rate": syntax_validity_rate,
-            "eval/color_entropy": color_entropy,
-            "eval/unique_tailwind_classes": unique_classes,
-            "eval/total_colors_used": len(all_colors),
-        }, step=step)
-        
-        # Log sample generations as table
-        if sample_generations:
+            
+            # Aggregate metrics
+            syntax_validity_rate = valid_syntax_count / 1  # Just 1 sample
+            color_entropy = compute_color_entropy(all_colors)
+            unique_classes = len(set(all_classes))
+            
+            # Log to W&B
             wandb.log({
-                "eval/sample_generations": wandb.Table(
-                    columns=list(sample_generations[0].keys()),
-                    data=[list(s.values()) for s in sample_generations]
-                )
+                "eval/syntax_validity_rate": syntax_validity_rate,
+                "eval/color_entropy": color_entropy,
+                "eval/unique_tailwind_classes": unique_classes,
+                "eval/total_colors_used": len(all_colors),
             }, step=step)
-        
-        model.train()
+            
+            # Log visual comparison as HTML
+            if visual_comparisons:
+                wandb.log({
+                    "eval/visual_progression": wandb.Html(visual_comparisons[0])
+                }, step=step)
+            
+            # Log sample generations as table
+            if sample_generations:
+                wandb.log({
+                    "eval/sample_details": wandb.Table(
+                        columns=list(sample_generations[0].keys()),
+                        data=[list(s.values()) for s in sample_generations]
+                    )
+                }, step=step)
+            
+            model.train()
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +309,7 @@ checkpoint_vol = modal.Volume.from_name("uiux-checkpoints", create_if_missing=Tr
 
 # GPU — H200 needed for training (batch_size=1, grad_accum=8, seq_len=4096)
 GPU_TYPE = "A100-80GB"
-TIMEOUT_HOURS = 1
+TIMEOUT_HOURS = 6  # Increased: full training needs ~4-5 hours with gradient offloading
 MAX_RETRIES = 1
 
 # LoRA target modules — all linear layers for best quality
@@ -279,6 +358,41 @@ class TrainingConfig:
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             model_short = self.model_name.split("/")[-1]
             self.experiment_name = f"{model_short}-r{self.lora_r}-{timestamp}"
+
+
+def load_config_from_yaml(yaml_path: str = "finetuning/train_config.yaml") -> dict:
+    """Load training configuration from YAML file."""
+    try:
+        with open(yaml_path, 'r') as f:
+            config_data = yaml.safe_load(f)
+        
+        # Flatten nested structure for TrainingConfig
+        flat_config = {
+            "model_name": config_data['model']['name'],
+            "max_seq_length": config_data['model']['max_seq_length'],
+            "load_in_4bit": config_data['model']['load_in_4bit'],
+            "lora_r": config_data['lora']['r'],
+            "lora_alpha": config_data['lora']['alpha'],
+            "lora_dropout": config_data['lora']['dropout'],
+            "learning_rate": config_data['training']['learning_rate'],
+            "num_epochs": config_data['training']['num_epochs'],
+            "max_steps": config_data['training']['max_steps'],
+            "batch_size": config_data['training']['batch_size'],
+            "gradient_accumulation_steps": config_data['training']['gradient_accumulation_steps'],
+            "warmup_ratio": config_data['training']['warmup_ratio'],
+            "weight_decay": config_data['training']['weight_decay'],
+            "lr_scheduler_type": config_data['training']['lr_scheduler_type'],
+            "logging_steps": config_data['logging']['logging_steps'],
+            "save_steps": config_data['logging']['save_steps'],
+            "eval_steps": config_data['logging']['eval_steps'],
+        }
+        return flat_config
+    except FileNotFoundError:
+        print(f"⚠️  Config file not found at {yaml_path}, using defaults")
+        return {}
+    except Exception as e:
+        print(f"⚠️  Error loading config: {e}, using defaults")
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -545,35 +659,63 @@ def finetune(config: TrainingConfig):
 # ---------------------------------------------------------------------------
 @app.local_entrypoint()
 def main(
-    model_name: str = "Qwen/Qwen3-Coder-Next-Base",
-    max_steps: int = -1,
-    num_epochs: int = 3,
-    lora_r: int = 16,
-    lora_alpha: int = 32,
-    learning_rate: float = 2e-4,
-    batch_size: int = 2,
-    gradient_accumulation_steps: int = 4,
-    max_seq_length: int = 8192,
+    config_file: str = "finetuning/train_config.yaml",
+    model_name: str = None,
+    max_steps: int = None,
+    num_epochs: int = None,
+    lora_r: int = None,
+    lora_alpha: int = None,
+    learning_rate: float = None,
+    batch_size: int = None,
+    gradient_accumulation_steps: int = None,
+    max_seq_length: int = None,
     experiment_name: str = None,
 ):
-    config = TrainingConfig(
-        model_name=model_name,
-        max_seq_length=max_seq_length,
-        lora_r=lora_r,
-        lora_alpha=lora_alpha,
-        learning_rate=learning_rate,
-        num_epochs=num_epochs,
-        max_steps=max_steps,
-        batch_size=batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        experiment_name=experiment_name,
-    )
+    """
+    Launch fine-tuning on Modal.
+    
+    Loads config from YAML file, then applies CLI overrides.
+    Example: modal run finetuning/modal_train.py --max-steps 5 --batch-size 2
+    """
+    # Load config from YAML
+    print(f"Loading config from {config_file}...")
+    yaml_config = load_config_from_yaml(config_file)
+    
+    # Start with YAML config, then apply CLI overrides
+    config_dict = {**yaml_config}  # Start with YAML values
+    
+    # Override with CLI args if provided
+    if model_name is not None:
+        config_dict['model_name'] = model_name
+    if max_steps is not None:
+        config_dict['max_steps'] = max_steps
+    if num_epochs is not None:
+        config_dict['num_epochs'] = num_epochs
+    if lora_r is not None:
+        config_dict['lora_r'] = lora_r
+    if lora_alpha is not None:
+        config_dict['lora_alpha'] = lora_alpha
+    if learning_rate is not None:
+        config_dict['learning_rate'] = learning_rate
+    if batch_size is not None:
+        config_dict['batch_size'] = batch_size
+    if gradient_accumulation_steps is not None:
+        config_dict['gradient_accumulation_steps'] = gradient_accumulation_steps
+    if max_seq_length is not None:
+        config_dict['max_seq_length'] = max_seq_length
+    if experiment_name is not None:
+        config_dict['experiment_name'] = experiment_name
+    
+    # Create TrainingConfig from merged config
+    config = TrainingConfig(**config_dict)
 
     print("Launching fine-tuning on Modal (A100 80GB)")
     print(f"  Model: {config.model_name}")
     print(f"  LoRA: r={config.lora_r}, alpha={config.lora_alpha}")
-    print(f"  Epochs: {config.num_epochs}, Max steps: {config.max_steps}")
+    print(f"  Batch size: {config.batch_size}, Grad accum: {config.gradient_accumulation_steps}")
     print(f"  Effective batch: {config.batch_size * config.gradient_accumulation_steps}")
+    print(f"  Seq length: {config.max_seq_length}")
+    print(f"  Epochs: {config.num_epochs}, Max steps: {config.max_steps}")
     print(f"  Experiment: {config.experiment_name}")
     print()
 
