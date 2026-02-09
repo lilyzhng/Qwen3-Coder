@@ -1,31 +1,36 @@
 """
-Fine-tune Qwen2.5-Coder-14B-Instruct on Modal using Unsloth (4-bit LoRA).
+Fine-tune Qwen2.5-Coder-14B (base model) on Modal using Unsloth for direct code generation.
 
-Based on the Unsloth Qwen2.5 Coder conversational notebook.
-Runs on a single GPU (A100/H100). Uses the FineTome-100k dataset.
-Logs metrics to W&B and sends an alert on completion.
+Unlike the conversational version, this uses the BASE model (not -Instruct) and trains
+on direct prompt→code completion without chat templates or special tokens.
+
+Optimized for UI/UX code generation tasks with the UIGEN dataset.
 
 Usage:
-    # Quick test (30 steps)
-    modal run finetuning/unsloth/modal_qwen_conversational.py --max-steps 30
+    # Quick test (30 steps) - requires HuggingFace dataset
+    modal run finetuning/unsloth/modal_qwen_code_generation.py --max-steps 30 --dataset-name lilyzhng/uigen-ui-code-gen
     
-    # Full training (1 epoch)
-    modal run finetuning/unsloth/modal_qwen_conversational.py --num-epochs 1
+    # Full training (1 epoch) with UIGEN data from HuggingFace
+    modal run finetuning/unsloth/modal_qwen_code_generation.py --num-epochs 1 --dataset-name lilyzhng/uigen-ui-code-gen
     
-    # Custom dataset size
-    modal run finetuning/unsloth/modal_qwen_conversational.py --max-steps 100 --train-size 1000
+    # Custom training size
+    modal run finetuning/unsloth/modal_qwen_code_generation.py --max-steps 100 --dataset-name lilyzhng/uigen-ui-code-gen --train-size 1000
+
+Note: You must push your dataset to HuggingFace Hub first using:
+    python finetuning/push_to_huggingface.py --repo-name lilyzhng/uigen-ui-code-gen
 """
 
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
+import json
 
 import modal
 
 # ---------------------------------------------------------------------------
 # Modal App & Infrastructure
 # ---------------------------------------------------------------------------
-app = modal.App("qwen-coder-finetune")
+app = modal.App("qwen-coder-code-gen")
 
 # Container image with Unsloth
 train_image = (
@@ -47,11 +52,9 @@ with train_image.imports():
     
     import torch
     import wandb
-    from datasets import load_dataset
-    from transformers import DataCollatorForSeq2Seq
+    from datasets import Dataset, load_dataset
     from trl import SFTConfig, SFTTrainer
     from unsloth import FastLanguageModel
-    from unsloth.chat_templates import get_chat_template, standardize_sharegpt, train_on_responses_only
 
 # ---------------------------------------------------------------------------
 # Persistent volumes
@@ -68,15 +71,14 @@ MAX_RETRIES = 1
 # ---------------------------------------------------------------------------
 @dataclass
 class TrainingConfig:
-    # Model
-    # # unsloth/Qwen3-4B-Instruct-2507-unsloth-bnb-4bit
-    model_name: str = "unsloth/Qwen2.5-Coder-14B-Instruct" 
-    max_seq_length: int = 2048
+    # Model - BASE model (not instruct) for direct code generation
+    model_name: str = "Qwen/Qwen2.5-Coder-14B"  # Base model, no chat template
+    max_seq_length: int = 4096  # Longer for code (up from 2048)
     load_in_4bit: bool = True
     
     # LoRA
-    lora_r: int = 16
-    lora_alpha: int = 16
+    lora_r: int = 32  # Higher rank for better code quality
+    lora_alpha: int = 32
     lora_dropout: float = 0.0
     target_modules: list = None  # Will be set in __post_init__
     
@@ -85,13 +87,14 @@ class TrainingConfig:
     num_epochs: int = 1
     max_steps: int = 30  # Set to -1 to use num_epochs
     batch_size: int = 1
-    gradient_accumulation_steps: int = 4
-    warmup_steps: int = 5
-    weight_decay: float = 0.001
-    lr_scheduler_type: str = "linear"
+    gradient_accumulation_steps: int = 8  # Higher for stability
+    warmup_steps: int = 10
+    weight_decay: float = 0.01
+    lr_scheduler_type: str = "cosine"  # Cosine often better for code
     
-    # Data
-    dataset_name: str = "mlabonne/FineTome-100k"
+    # Data - supports both local JSONL and HuggingFace datasets
+    dataset_path: str = None  # Local JSONL path (optional, for local dev)
+    dataset_name: str = None  # HuggingFace dataset name (e.g., "username/uigen-dataset")
     train_size: int = None  # None = use full dataset
     
     # Logging
@@ -109,7 +112,7 @@ class TrainingConfig:
     # Experiment
     seed: int = 3407
     experiment_name: Optional[str] = None
-    wandb_project: str = "qwen-coder-finetune"
+    wandb_project: str = "qwen-coder-code-gen"
     
     def __post_init__(self):
         if self.target_modules is None:
@@ -142,44 +145,112 @@ def print_gpu_memory(step_name: str):
 # ---------------------------------------------------------------------------
 # Data Loading
 # ---------------------------------------------------------------------------
-def load_and_format_data(tokenizer, dataset_name: str, train_size: int = None):
-    """Load dataset from HuggingFace and format for Qwen chat template."""
-    print(f"Loading dataset: {dataset_name}")
+def load_and_format_data(tokenizer, config: TrainingConfig):
+    """Load dataset and format for direct code generation (no chat template)."""
     
-    # Load dataset
-    if train_size:
-        dataset = load_dataset(dataset_name, split=f"train[:{train_size}]")
-        print(f"Loaded {len(dataset)} samples (limited to {train_size})")
+    # Try local JSONL first, then HuggingFace
+    if config.dataset_path:
+        print(f"Loading local dataset: {config.dataset_path}")
+        try:
+            data = []
+            with open(config.dataset_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    data.append(json.loads(line))
+            
+            if config.train_size:
+                data = data[:config.train_size]
+            
+            print(f"Loaded {len(data)} samples from local JSONL")
+            
+            # Format as prompt→code completion
+            texts = []
+            for item in data:
+                # UIGEN format: has 'question' and 'answer' fields
+                if 'messages' in item:
+                    # ChatML format - extract and flatten
+                    text = ""
+                    for msg in item['messages']:
+                        if msg['role'] == 'user':
+                            text += f"# Task: {msg['content']}\n\n"
+                        elif msg['role'] == 'assistant':
+                            text += msg['content']
+                    texts.append(text)
+                elif 'question' in item and 'answer' in item:
+                    # Direct question/answer format
+                    prompt = f"# Task: Generate HTML/CSS code\n# Requirements: {item['question']}\n\n"
+                    completion = item['answer']
+                    texts.append(f"{prompt}{completion}")
+                else:
+                    # Generic text field
+                    texts.append(item.get('text', str(item)))
+            
+            dataset = Dataset.from_dict({"text": texts})
+            
+        except FileNotFoundError:
+            print(f"Warning: Local file not found: {config.dataset_path}")
+            if config.dataset_name:
+                print("Falling back to HuggingFace dataset...")
+                return load_hf_dataset(tokenizer, config)
+            else:
+                raise FileNotFoundError(
+                    f"Local dataset file not found: {config.dataset_path}\n"
+                    f"To use a local dataset with Modal, you need to mount it using modal.Mount.\n"
+                    f"Alternatively, specify a HuggingFace dataset with --dataset-name."
+                )
+    
+    elif config.dataset_name:
+        return load_hf_dataset(tokenizer, config)
+    
     else:
-        dataset = load_dataset(dataset_name, split="train")
-        print(f"Loaded {len(dataset)} samples (full dataset)")
-    
-    # Standardize ShareGPT format to HuggingFace format
-    print("Standardizing dataset format...")
-    dataset = standardize_sharegpt(dataset)
-    
-    # Apply Qwen chat template
-    def formatting_prompts_func(examples):
-        convos = examples["conversations"]
-        texts = [
-            tokenizer.apply_chat_template(
-                convo, 
-                tokenize=False, 
-                add_generation_prompt=False
-            ) 
-            for convo in convos
-        ]
-        return {"text": texts}
-    
-    print("Applying Qwen-2.5 chat template...")
-    dataset = dataset.map(formatting_prompts_func, batched=True)
+        raise ValueError("Must specify either dataset_path or dataset_name")
     
     # Show example
-    print(f"\nExample conversation (sample 5):")
-    print("="*60)
-    print(dataset[5]["text"][:500] + "..." if len(dataset[5]["text"]) > 500 else dataset[5]["text"])
-    print("="*60 + "\n")
+    print(f"\nExample formatted text (sample 0):")
+    print("="*80)
+    print(dataset[0]["text"][:500] + "..." if len(dataset[0]["text"]) > 500 else dataset[0]["text"])
+    print("="*80 + "\n")
     
+    return dataset
+
+
+def load_hf_dataset(tokenizer, config: TrainingConfig):
+    """Load dataset from HuggingFace."""
+    print(f"Loading HuggingFace dataset: {config.dataset_name}")
+    
+    if config.train_size:
+        dataset = load_dataset(config.dataset_name, split=f"train[:{config.train_size}]")
+    else:
+        dataset = load_dataset(config.dataset_name, split="train")
+    
+    print(f"Loaded {len(dataset)} samples")
+    
+    # Check if dataset already has 'text' field in the correct format
+    # If so, no need to reformat (UIGEN dataset is already formatted)
+    if 'text' in dataset.column_names:
+        print("Dataset already has 'text' field, using as-is")
+        return dataset
+    
+    # Otherwise, format the data (for other dataset types)
+    def formatting_prompts_func(examples):
+        # When batched=True, examples is a dict with keys like {'field': [val1, val2, ...]}
+        texts = []
+        
+        # Handle conversations format
+        if 'conversations' in examples:
+            for conversation in examples['conversations']:
+                text = ""
+                for msg in conversation:
+                    text += f"{msg.get('content', msg.get('value', ''))}\n\n"
+                texts.append(text)
+        # Handle other formats - add more cases as needed
+        else:
+            # Fallback: stringify the first available field
+            first_key = list(examples.keys())[0]
+            texts = [str(item) for item in examples[first_key]]
+        
+        return {"text": texts}
+    
+    dataset = dataset.map(formatting_prompts_func, batched=True)
     return dataset
 
 
@@ -226,7 +297,7 @@ _gpu_functions = {
 
 
 def _finetune_impl(config: TrainingConfig):
-    """Run QLoRA fine-tuning on Modal with Unsloth."""
+    """Run QLoRA fine-tuning on Modal with Unsloth (BASE model, no chat template)."""
     
     # Initialize W&B
     wandb.init(
@@ -238,15 +309,16 @@ def _finetune_impl(config: TrainingConfig):
     
     print_gpu_memory("Before model load")
     
-    # Load model with Unsloth (handles 4-bit quantization efficiently)
-    print(f"Loading model: {config.model_name}")
+    # Load BASE model (no instruct tuning, no chat template)
+    print(f"Loading BASE model: {config.model_name}")
     print(f"  - Max seq length: {config.max_seq_length}")
     print(f"  - 4-bit quantization: {config.load_in_4bit}")
+    print(f"  - Mode: Direct code generation (no chat template)")
     
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=config.model_name,
         max_seq_length=config.max_seq_length,
-        dtype=None,  # Auto-detect (Float16 for T4/V100, Bfloat16 for Ampere+)
+        dtype=None,  # Auto-detect
         load_in_4bit=config.load_in_4bit,
     )
     
@@ -270,7 +342,7 @@ def _finetune_impl(config: TrainingConfig):
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
         bias="none",
-        use_gradient_checkpointing="unsloth",  # Use Unsloth's optimized checkpointing
+        use_gradient_checkpointing="unsloth",
         random_state=config.seed,
         use_rslora=False,
         loftq_config=None,
@@ -291,20 +363,12 @@ def _finetune_impl(config: TrainingConfig):
     
     print_gpu_memory("After LoRA setup")
     
-    # Set up Qwen-2.5 chat template
-    print("\nSetting up Qwen-2.5 chat template...")
-    tokenizer = get_chat_template(
-        tokenizer,
-        chat_template="qwen-2.5",
-    )
+    # NO chat template setup - base model uses direct text completion
+    print("\nSkipping chat template (base model uses direct completion)")
     
     # Load and format data
     print()
-    dataset = load_and_format_data(
-        tokenizer,
-        dataset_name=config.dataset_name,
-        train_size=config.train_size,
-    )
+    dataset = load_and_format_data(tokenizer, config)
     
     print_gpu_memory("After data load")
     
@@ -313,13 +377,10 @@ def _finetune_impl(config: TrainingConfig):
     print(f"Checkpoint path: {checkpoint_path}\n")
     
     # Training arguments
-    # Configure epochs vs steps properly
     if config.max_steps > 0:
-        # Using max_steps mode
-        num_train_epochs = 1  # Set to 1 when using max_steps
+        num_train_epochs = 1
         max_steps = config.max_steps
     else:
-        # Using epochs mode
         num_train_epochs = config.num_epochs
         max_steps = -1
     
@@ -331,7 +392,7 @@ def _finetune_impl(config: TrainingConfig):
         max_steps=max_steps,
         learning_rate=config.learning_rate,
         logging_steps=config.logging_steps,
-        optim="adamw_8bit",  # Use 8-bit optimizer to save memory
+        optim="adamw_8bit",
         weight_decay=config.weight_decay,
         lr_scheduler_type=config.lr_scheduler_type,
         seed=config.seed,
@@ -341,7 +402,7 @@ def _finetune_impl(config: TrainingConfig):
         save_strategy="steps",
     )
     
-    # Create trainer
+    # Create trainer (NO response masking for base models)
     print("Initializing SFTTrainer...")
     trainer = SFTTrainer(
         model=model,
@@ -349,46 +410,31 @@ def _finetune_impl(config: TrainingConfig):
         train_dataset=dataset,
         dataset_text_field="text",
         max_seq_length=config.max_seq_length,
-        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
-        packing=False,  # Can make training 5x faster for short sequences
+        packing=False,
         args=training_args,
     )
     
-    # Train only on assistant responses (mask user inputs and system prompts)
-    print("Configuring response-only training (masking user/system prompts)...")
-    trainer = train_on_responses_only(
-        trainer,
-        instruction_part="<|im_start|>user\n",
-        response_part="<|im_start|>assistant\n",
-    )
-    
-    # Verify masking on a sample
-    print("\nVerifying masking on sample 5:")
-    print("Full text:")
-    print(tokenizer.decode(trainer.train_dataset[5]["input_ids"])[:200] + "...")
-    
-    space = tokenizer(" ", add_special_tokens=False).input_ids[0]
-    masked_text = tokenizer.decode([space if x == -100 else x for x in trainer.train_dataset[5]["labels"]])
-    print("\nMasked (only assistant is trained):")
-    print(masked_text[:200] + "...")
-    print()
+    # NO train_on_responses_only - base model trains on full text
+    print("Training on full text (no masking - base model)")
     
     print_gpu_memory("After trainer init")
     
     # Print training summary
     effective_batch = config.batch_size * config.gradient_accumulation_steps
-    print("\n" + "="*60)
+    print("\n" + "="*80)
     print("Training Configuration Summary")
-    print("="*60)
-    print(f"Model: {config.model_name}")
-    print(f"Dataset: {config.dataset_name} ({len(dataset)} samples)")
+    print("="*80)
+    print(f"Model: {config.model_name} (BASE - no chat template)")
+    print(f"Dataset: {config.dataset_path or config.dataset_name} ({len(dataset)} samples)")
     print(f"Batch size: {config.batch_size} x {config.gradient_accumulation_steps} = {effective_batch}")
     print(f"Learning rate: {config.learning_rate}")
+    print(f"LR scheduler: {config.lr_scheduler_type}")
     print(f"Training: {config.num_epochs} epoch(s), max {config.max_steps} steps")
+    print(f"Sequence length: {config.max_seq_length}")
     print(f"GPU: {config.gpu_type}")
     print(f"Experiment: {config.experiment_name}")
     print(f"W&B: {config.wandb_project}")
-    print("="*60 + "\n")
+    print("="*80 + "\n")
     
     # Record start memory
     start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
@@ -397,9 +443,9 @@ def _finetune_impl(config: TrainingConfig):
     print("Starting training...\n")
     trainer_stats = trainer.train()
     
-    print("\n" + "="*60)
+    print("\n" + "="*80)
     print("Training Complete!")
-    print("="*60)
+    print("="*80)
     
     # Print memory and time stats
     gpu_stats = torch.cuda.get_device_properties(0)
@@ -424,7 +470,7 @@ def _finetune_impl(config: TrainingConfig):
                 final_loss = f"{log['loss']:.4f}"
                 break
     print(f"Final loss: {final_loss}")
-    print("="*60 + "\n")
+    print("="*80 + "\n")
     
     # Push to HuggingFace (default behavior)
     if config.push_to_hub:
@@ -509,23 +555,28 @@ def main(
     gradient_accumulation_steps: int = None,
     max_seq_length: int = None,
     gpu_type: str = None,
+    dataset_path: str = None,
+    dataset_name: str = None,
     experiment_name: str = None,
     push_to_hub: bool = None,
     hf_repo_name: str = None,
     hf_private: bool = None,
 ):
     """
-    Launch Qwen fine-tuning on Modal.
+    Launch Qwen BASE model fine-tuning for direct code generation on Modal.
     
     Examples:
-        # Quick test (with --detach!)
-        modal run --detach finetuning/unsloth/modal_qwen_conversational.py --max-steps 30
+        # Quick test with local UIGEN data (with --detach!)
+        modal run --detach finetuning/unsloth/modal_qwen_code_generation.py --max-steps 30
         
-        # Full epoch with custom dataset size
-        modal run --detach finetuning/unsloth/modal_qwen_conversational.py --num-epochs 1 --train-size 10000
+        # Full epoch with HF dataset (recommended)
+        modal run --detach finetuning/unsloth/modal_qwen_code_generation.py --num-epochs 1 --dataset-name lilyzhng/uigen-dataset
         
         # Disable HuggingFace push
-        modal run --detach finetuning/unsloth/modal_qwen_conversational.py --num-epochs 1 --push-to-hub false
+        modal run --detach finetuning/unsloth/modal_qwen_code_generation.py --num-epochs 1 --push-to-hub false
+        
+        # Custom HF repo name
+        modal run --detach finetuning/unsloth/modal_qwen_code_generation.py --num-epochs 1 --hf-repo-name "myuser/my-model"
     """
     # Build config with CLI overrides
     config_dict = {}
@@ -551,6 +602,10 @@ def main(
         config_dict['max_seq_length'] = max_seq_length
     if gpu_type is not None:
         config_dict['gpu_type'] = gpu_type
+    if dataset_path is not None:
+        config_dict['dataset_path'] = dataset_path
+    if dataset_name is not None:
+        config_dict['dataset_name'] = dataset_name
     if experiment_name is not None:
         config_dict['experiment_name'] = experiment_name
     if push_to_hub is not None:
@@ -562,12 +617,12 @@ def main(
     
     config = TrainingConfig(**config_dict)
     
-    print("="*60)
-    print("Qwen2.5-Coder Fine-tuning on Modal")
-    print("="*60)
+    print("="*80)
+    print("Qwen2.5-Coder BASE Model Fine-tuning (Direct Code Generation)")
+    print("="*80)
     print(f"Model: {config.model_name}")
     print(f"GPU: {config.gpu_type}")
-    print(f"Dataset: {config.dataset_name}")
+    print(f"Dataset: {config.dataset_path or config.dataset_name}")
     if config.train_size:
         print(f"  - Training samples: {config.train_size}")
     else:
@@ -576,6 +631,7 @@ def main(
     print(f"Batch: {config.batch_size} x {config.gradient_accumulation_steps} = {config.batch_size * config.gradient_accumulation_steps}")
     print(f"Training: {config.num_epochs} epoch(s), max {config.max_steps} steps")
     print(f"Learning rate: {config.learning_rate}")
+    print(f"LR scheduler: {config.lr_scheduler_type}")
     print(f"Sequence length: {config.max_seq_length}")
     print(f"Experiment: {config.experiment_name}")
     print(f"W&B project: {config.wandb_project}")
@@ -583,7 +639,7 @@ def main(
     if config.push_to_hub:
         print(f"  - Repository: {config.hf_repo_name}")
         print(f"  - Private: {config.hf_private}")
-    print("="*60 + "\n")
+    print("="*80 + "\n")
     
     # Dispatch to the appropriate GPU-specific function
     if config.gpu_type not in _gpu_functions:
@@ -592,11 +648,13 @@ def main(
     print(f"Launching on Modal with {config.gpu_type}...\n")
     experiment = _gpu_functions[config.gpu_type].remote(config)
     
-    print("\n" + "="*60)
+    print("\n" + "="*80)
     print(f"Done! Experiment: {experiment}")
-    print("="*60)
+    print("="*80)
     print("\nTo download the LoRA adapter:")
     print(f"  modal volume get qwen-checkpoints /{experiment}/final_model ./qwen_lora/")
     print("\nTo download the merged 16-bit model:")
     print(f"  modal volume get qwen-checkpoints /{experiment}/merged_16bit ./qwen_merged/")
+    print("\nFor inference with base model:")
+    print("  # Load base model + LoRA adapter, then use direct completion (no chat template)")
     print()
