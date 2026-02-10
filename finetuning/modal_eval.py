@@ -160,14 +160,16 @@ def run_evaluation(config: EvalConfig):
     JUDGE_PROMPT = """\
 Rate this UI code from 1-10. Evaluate BOTH the code quality AND the visual rendering.
 
-Failure modes (tag all that apply):
-- generic-colors: boring default palette
-- broken-layout: elements overlap, misaligned
-- broken-code: syntax errors, blank page
-- wrong-framework: doesn't use Tailwind CSS
-- no-design-thinking: works but looks like a developer prototype
-- missing-states: no hover/transition polish
-- good: well-designed and production-ready
+Scoring rubric (start at 10, subtract points for each issue):
+- broken-code (-4): syntax errors, blank page, crashes, no output
+- broken-layout (-3): elements overlap, misaligned, unusable
+- wrong-framework (-2): doesn't use Tailwind CSS as required
+- generic-colors (-2): boring default palette, no design effort
+- no-design-thinking (-2): works but looks like a developer prototype
+- missing-states (-1): no hover/transition/animation polish
+- good (+0): well-designed and production-ready (no penalty)
+
+Minimum score is 1. Tag all failure modes that apply.
 
 User asked for: {prompt}
 
@@ -178,7 +180,7 @@ GT (ground truth):
 {reference}
 
 Respond in EXACTLY this JSON format:
-{{"score": 5, "failure_modes": ["generic-colors"], "reasoning": "one sentence summary"}}"""
+{{"score": 7, "failure_modes": ["generic-colors", "missing-states"], "penalties": {{"generic-colors": -2, "missing-states": -1}}, "reasoning": "Functional layout but uses default gray/blue palette (-2) and lacks hover states (-1). Total: 10 - 3 = 7"}}"""
 
     # ---------------------------------------------------------------------------
     # Helper Functions
