@@ -108,6 +108,7 @@ class TrainingConfig:
     push_to_hub: bool = True  # Push to HuggingFace after training
     hf_repo_name: Optional[str] = None  # HF repo name (defaults to experiment_name)
     hf_private: bool = False  # Make repo private
+    hf_username: str = "lilyzhng"  # HF username
     
     # Experiment
     seed: int = 3407
@@ -126,6 +127,8 @@ class TrainingConfig:
             self.experiment_name = f"{model_short}-r{self.lora_r}-{timestamp}"
         if self.hf_repo_name is None:
             self.hf_repo_name = self.experiment_name
+        if self.hf_username is None:
+            self.hf_username = self.hf_username
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +531,7 @@ def _finetune_impl(config: TrainingConfig):
     print("Training Complete!")
     print("="*80)
     if config.push_to_hub:
-        print(f"✅ Model available at: https://huggingface.co/{config.hf_repo_name}")
+        print(f"✅ Model available at: https://huggingface.co/{config.hf_username}/{config.hf_repo_name}")
     print(f"Experiment: {config.experiment_name}")
     print(f"Training time: {runtime_minutes} minutes")
     print(f"Final loss: {final_loss}")
@@ -560,6 +563,7 @@ def main(
     experiment_name: str = None,
     push_to_hub: bool = None,
     hf_repo_name: str = None,
+    hf_username: str = None,    
     hf_private: bool = None,
 ):
     """
@@ -614,6 +618,8 @@ def main(
         config_dict['hf_repo_name'] = hf_repo_name
     if hf_private is not None:
         config_dict['hf_private'] = hf_private
+    if hf_username is not None:
+        config_dict['hf_username'] = hf_username
     
     config = TrainingConfig(**config_dict)
     

@@ -1,24 +1,59 @@
 """
 Evaluate a model's UI/UX code generation quality using the UIGEN test split.
 
-Sends each test prompt to a model via OpenRouter, then uses a judge model
-(Gemini 3 Pro via OpenRouter) to automatically score and tag failure modes.
-Also saves generated HTML with Tailwind CDN and screenshots for visual review.
+Supports three modes:
+1. OpenRouter API: Send prompts to hosted models via OpenRouter
+2. Local LoRA: Load a finetuned LoRA model locally (for Modal/GPU servers)
+3. Local Base: Load a base model locally for comparison
+
+Uses a judge model (Gemini 3 Pro via OpenRouter) to automatically score and
+tag failure modes. Also saves generated HTML with Tailwind CDN and screenshots.
 
 Usage:
-    # Baseline evaluation (with auto-judging)
+    # Evaluate via OpenRouter API
     python finetuning/eval_uiux.py \
         --model "qwen/qwen3-coder-next" \
         --test-data data/uigen_test.jsonl \
         --output-dir eval_results/baseline \
         --limit 5
 
+    # Evaluate a local LoRA model (for Modal)
+    python finetuning/eval_uiux.py \
+        --lora-model "lilyzhng/Qwen2.5-Coder-14B-r32-20260208-164425" \
+        --test-data data/uigen_test.jsonl \
+        --output-dir eval_results/lora_eval \
+        --limit 10
+
+    # Evaluate a local base model (for comparison)
+    python finetuning/eval_uiux.py \
+        --local-model "Qwen/Qwen2.5-Coder-14B-Instruct" \
+        --test-data data/uigen_test.jsonl \
+        --output-dir eval_results/base_eval \
+        --limit 10
+
     # Without judge (manual review only)
     python finetuning/eval_uiux.py \
-        --model "qwen/qwen3-coder-next" \
+        --lora-model "lilyzhng/Qwen2.5-Coder-14B-r32-20260208-164425" \
         --test-data data/uigen_test.jsonl \
-        --output-dir eval_results/baseline \
+        --output-dir eval_results/lora_eval \
         --no-judge
+
+Comparison workflow:
+    # 1. Evaluate base model
+    python finetuning/eval_uiux.py \
+        --local-model "Qwen/Qwen2.5-Coder-14B-Instruct" \
+        --test-data data/uigen_test.jsonl \
+        --output-dir eval_results/base \
+        --limit 20
+
+    # 2. Evaluate LoRA model
+    python finetuning/eval_uiux.py \
+        --lora-model "lilyzhng/Qwen2.5-Coder-14B-r32-20260208-164425" \
+        --test-data data/uigen_test.jsonl \
+        --output-dir eval_results/lora \
+        --limit 20
+
+    # 3. Compare in W&B dashboard - both runs are in the same project
 """
 
 import argparse
@@ -41,8 +76,13 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # Defaults
 DEFAULT_JUDGE_MODEL = "google/gemini-3-pro-preview"
+DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-Coder-14B"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 WANDB_PROJECT = "uiux-eval"
+
+# Global variables for local model (initialized lazily)
+_local_model = None
+_local_tokenizer = None
 
 HTML_TEMPLATE = """\
 <!DOCTYPE html>
@@ -177,6 +217,122 @@ def generate_response(client: OpenAI, model: str, question: str) -> str:
         top_p=0.95,
     )
     return response.choices[0].message.content
+
+
+def load_local_model(
+    model_name: str,
+    base_model: str = None,
+    max_seq_length: int = 4096,
+    load_in_4bit: bool = True,
+    is_lora: bool = True,
+):
+    """Load a model using Unsloth for fast inference.
+    
+    Args:
+        model_name: HuggingFace model ID (LoRA adapter or base model)
+        base_model: Base model to load tokenizer from (for chat template). 
+                    If None, uses model_name for tokenizer.
+        max_seq_length: Maximum sequence length
+        load_in_4bit: Whether to load in 4-bit quantization
+        is_lora: Whether this is a LoRA adapter (True) or base model (False)
+    
+    Returns:
+        Tuple of (model, tokenizer)
+    """
+    global _local_model, _local_tokenizer
+    
+    if _local_model is not None:
+        return _local_model, _local_tokenizer
+    
+    model_type = "LoRA" if is_lora else "base"
+    print(f"Loading {model_type} model: {model_name}")
+    
+    # Disable Unsloth statistics check to avoid timeout issues
+    os.environ["UNSLOTH_DISABLE_STATISTICS"] = "1"
+    
+    from unsloth import FastLanguageModel
+    from transformers import AutoTokenizer
+    
+    # Load the model
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=max_seq_length,
+        load_in_4bit=load_in_4bit,
+        load_in_8bit=not load_in_4bit,
+    )
+    
+    # For LoRA models, the tokenizer might not have chat template
+    # Load from base model if specified
+    if is_lora and base_model:
+        print(f"Loading tokenizer from base model: {base_model}")
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
+    
+    # Enable fast inference
+    FastLanguageModel.for_inference(model)
+    
+    _local_model = model
+    _local_tokenizer = tokenizer
+    
+    print("Model loaded successfully!")
+    return model, tokenizer
+
+
+# Alias for backward compatibility
+def load_local_lora_model(
+    lora_model: str,
+    base_model: str = DEFAULT_BASE_MODEL,
+    max_seq_length: int = 4096,
+    load_in_4bit: bool = True,
+):
+    """Load a LoRA model. Wrapper for load_local_model."""
+    return load_local_model(
+        model_name=lora_model,
+        base_model=base_model,
+        max_seq_length=max_seq_length,
+        load_in_4bit=load_in_4bit,
+        is_lora=True,
+    )
+
+
+def generate_response_local(model, tokenizer, question: str, max_new_tokens: int = 4096, use_chat_template: bool = False) -> str:
+    """Generate a response using a local model.
+    
+    Args:
+        model: The loaded model
+        tokenizer: The tokenizer
+        question: The user prompt
+        max_new_tokens: Maximum tokens to generate
+        use_chat_template: If True, use chat template. If False, use raw text (for base models)
+    
+    Returns:
+        The generated response text
+    """
+    if use_chat_template and tokenizer.chat_template is not None:
+        messages = [{"role": "user", "content": question}]
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        # For base models without chat template, use raw prompt
+        text = question
+    
+    inputs = tokenizer(text, return_tensors="pt").to("cuda")
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=20,
+        do_sample=True,
+    )
+    
+    response = tokenizer.decode(
+        outputs[0][inputs["input_ids"].shape[1]:], 
+        skip_special_tokens=True
+    )
+    return response
 
 
 def render_html_to_screenshot(
@@ -416,11 +572,28 @@ def main():
     parser = argparse.ArgumentParser(
         description="Evaluate UI/UX code generation quality"
     )
-    parser.add_argument(
+    # Model selection (mutually exclusive: OpenRouter vs Local LoRA vs Local Base)
+    model_group = parser.add_mutually_exclusive_group(required=True)
+    model_group.add_argument(
         "--model",
         type=str,
-        required=True,
         help="OpenRouter model ID (e.g. qwen/qwen3-coder-next)",
+    )
+    model_group.add_argument(
+        "--lora-model",
+        type=str,
+        help="HuggingFace LoRA model ID (e.g. lilyzhng/Qwen2.5-Coder-14B-r32-20260208-164425)",
+    )
+    model_group.add_argument(
+        "--local-model",
+        type=str,
+        help="HuggingFace base model ID to load locally (e.g. Qwen/Qwen2.5-Coder-14B-Instruct)",
+    )
+    parser.add_argument(
+        "--base-model",
+        type=str,
+        default=DEFAULT_BASE_MODEL,
+        help=f"Base model for tokenizer when using --lora-model (default: {DEFAULT_BASE_MODEL})",
     )
     parser.add_argument(
         "--test-data",
@@ -462,26 +635,75 @@ def main():
         default=WANDB_PROJECT,
         help=f"W&B project name (default: {WANDB_PROJECT})",
     )
+    parser.add_argument(
+        "--load-in-8bit",
+        action="store_true",
+        help="Load LoRA model in 8-bit instead of 4-bit (uses more VRAM but more accurate)",
+    )
     args = parser.parse_args()
 
     # Setup
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Setup OpenRouter client (used for both generation and judging)
+    # Determine model mode
+    use_lora_model = args.lora_model is not None
+    use_local_base_model = args.local_model is not None
+    use_local_model = use_lora_model or use_local_base_model
+    
+    if use_lora_model:
+        model_name = args.lora_model
+        model_type_str = "local LoRA"
+    elif use_local_base_model:
+        model_name = args.local_model
+        model_type_str = "local base"
+    else:
+        model_name = args.model
+        model_type_str = "OpenRouter"
+    
+    # Setup OpenRouter client (always needed for judging, optionally for generation)
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
-    if not openrouter_key:
-        print("ERROR: OPENROUTER_API_KEY not set in .env.")
-        print("  Add your key to .env: OPENROUTER_API_KEY=your-key-here")
-        sys.exit(1)
+    openrouter_client = None
+    
+    if not use_local_model or not args.no_judge:
+        if not openrouter_key:
+            if use_local_model and args.no_judge:
+                print("Note: No OPENROUTER_API_KEY set, but not needed for local model without judge.")
+            else:
+                print("ERROR: OPENROUTER_API_KEY not set in .env.")
+                print("  Add your key to .env: OPENROUTER_API_KEY=your-key-here")
+                if not use_local_model:
+                    sys.exit(1)
+        else:
+            openrouter_client = OpenAI(
+                base_url=OPENROUTER_BASE_URL,
+                api_key=openrouter_key,
+            )
 
-    openrouter_client = OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=openrouter_key,
-    )
+    # Load local model if using LoRA or local base model
+    local_model = None
+    local_tokenizer = None
+    if use_lora_model:
+        local_model, local_tokenizer = load_local_model(
+            model_name=args.lora_model,
+            base_model=args.base_model,
+            load_in_4bit=not args.load_in_8bit,
+            is_lora=True,
+        )
+    elif use_local_base_model:
+        local_model, local_tokenizer = load_local_model(
+            model_name=args.local_model,
+            base_model=None,  # Use model's own tokenizer
+            load_in_4bit=not args.load_in_8bit,
+            is_lora=False,
+        )
 
     use_judge = not args.no_judge
     if use_judge:
-        print(f"Judge model: {args.judge_model} (via OpenRouter)")
+        if not openrouter_client:
+            print("WARNING: No OpenRouter client available for judging. Disabling judge.")
+            use_judge = False
+        else:
+            print(f"Judge model: {args.judge_model} (via OpenRouter)")
 
     # Load test data
     samples = load_test_data(args.test_data)
@@ -489,18 +711,20 @@ def main():
     if args.limit:
         samples = samples[: args.limit]
     print(f"Evaluating {len(samples)} of {total_available} test samples from {args.test_data}")
-    print(f"Model: {args.model}")
+    print(f"Model: {model_name} ({model_type_str})")
     print(f"Output: {args.output_dir}")
     print()
 
     # Initialize W&B run — names the run after the model for easy comparison
-    model_short = args.model.split("/")[-1]
+    model_short = model_name.split("/")[-1]
     run_name = f"{model_short}-{time.strftime('%m%d-%H%M')}"
     run = wandb.init(
         project=args.wandb_project,
         name=run_name,
         config={
-            "model": args.model,
+            "model": model_name,
+            "model_type": model_type_str,
+            "base_model": args.base_model if use_lora_model else None,
             "judge_model": args.judge_model if use_judge else "none",
             "test_data": args.test_data,
             "num_samples": len(samples),
@@ -543,7 +767,11 @@ def main():
         else:
             # Generate model response
             try:
-                raw_response = generate_response(openrouter_client, args.model, question)
+                if use_local_model:
+                    # Base models don't have chat template, use raw prompt
+                    raw_response = generate_response_local(local_model, local_tokenizer, question, use_chat_template=False)
+                else:
+                    raw_response = generate_response(openrouter_client, args.model, question)
             except Exception as e:
                 print(f"  ERROR generating: {e}")
                 raw_response = f"ERROR: {e}"
@@ -639,7 +867,7 @@ def main():
                 wandb.summary[f"failure/{mode}"] = count
 
     # Generate local report
-    report = generate_report(samples, judgments, args.model, args.judge_model, use_judge)
+    report = generate_report(samples, judgments, model_name, args.judge_model, use_judge)
     report_path = os.path.join(args.output_dir, "report.md")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report)
