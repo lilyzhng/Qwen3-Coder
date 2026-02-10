@@ -158,29 +158,30 @@ def run_evaluation(config: EvalConfig):
 </div>"""
 
     JUDGE_PROMPT = """\
-Rate this UI code from 1-10. Evaluate BOTH the code quality AND the visual rendering.
+You are a UI code quality judge. Rate the generation from 1-10.
 
-Scoring rubric (start at 10, subtract points for each issue):
-- broken-code (-4): syntax errors, blank page, crashes, no output
-- broken-layout (-3): elements overlap, misaligned, unusable
-- wrong-framework (-2): doesn't use Tailwind CSS as required
-- generic-colors (-2): boring default palette, no design effort
-- no-design-thinking (-2): works but looks like a developer prototype
-- missing-states (-1): no hover/transition/animation polish
-- good (+0): well-designed and production-ready (no penalty)
+SCORING RUBRIC (start at 10, subtract for issues):
+- broken-code (-4): syntax errors, blank page, no output
+- broken-layout (-3): elements overlap, misaligned, unusable  
+- wrong-framework (-2): doesn't use Tailwind CSS
+- generic-colors (-2): boring default palette
+- no-design-thinking (-2): looks like developer prototype
+- missing-states (-1): no hover/transition polish
 
-Minimum score is 1. Tag all failure modes that apply.
+TASK: {prompt}
 
-User asked for: {prompt}
-
-Generation (model output):
+GENERATION:
 {model_output}
 
-GT (ground truth):
+GROUND TRUTH:
 {reference}
 
-Respond in EXACTLY this JSON format:
-{{"score": 7, "failure_modes": ["generic-colors", "missing-states"], "penalties": {{"generic-colors": -2, "missing-states": -1}}, "reasoning": "Functional layout but uses default gray/blue palette (-2) and lacks hover states (-1). Total: 10 - 3 = 7"}}"""
+IMPORTANT: You MUST respond with ONLY a valid JSON object. No other text before or after.
+Do not explain your reasoning outside the JSON. Put all reasoning inside the "reasoning" field.
+
+```json
+{{"score": <1-10>, "failure_modes": ["<mode1>", "<mode2>"], "reasoning": "<brief explanation with penalty math>"}}
+```"""
 
     # ---------------------------------------------------------------------------
     # Helper Functions
@@ -264,7 +265,7 @@ Respond in EXACTLY this JSON format:
                 return base64.b64encode(f.read()).decode("utf-8")
         return ""
 
-    def judge_output(client, judge_model, prompt, model_output, reference, gen_img, gt_img) -> dict:
+    def judge_output(client, judge_model, prompt, model_output, reference, gen_img, gt_img, max_retries: int = 2) -> dict:
         judge_text = JUDGE_PROMPT.format(
             prompt=prompt,
             model_output=model_output[:4000],
@@ -272,36 +273,101 @@ Respond in EXACTLY this JSON format:
         )
         content_parts = [{"type": "text", "text": judge_text}]
         
-        if os.path.exists(gen_img):
-            content_parts.append({"type": "text", "text": "\n\nGeneration screenshot:"})
-            content_parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{image_to_base64(gen_img)}"},
-            })
-        if os.path.exists(gt_img):
-            content_parts.append({"type": "text", "text": "\n\nGround truth screenshot:"})
-            content_parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{image_to_base64(gt_img)}"},
-            })
+        # Debug: check if images exist
+        gen_exists = gen_img and os.path.exists(gen_img)
+        gt_exists = gt_img and os.path.exists(gt_img)
+        print(f"    Images: gen={gen_exists}, gt={gt_exists}")
+        
+        if gen_exists:
+            gen_b64 = image_to_base64(gen_img)
+            if gen_b64:
+                content_parts.append({"type": "text", "text": "\n\nGeneration screenshot:"})
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{gen_b64}"},
+                })
+        if gt_exists:
+            gt_b64 = image_to_base64(gt_img)
+            if gt_b64:
+                content_parts.append({"type": "text", "text": "\n\nGround truth screenshot:"})
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{gt_b64}"},
+                })
 
-        try:
-            response = client.chat.completions.create(
-                model=judge_model,
-                messages=[{"role": "user", "content": content_parts}],
-                max_tokens=1024,
-                temperature=0.0,
-            )
-            content = response.choices[0].message.content.strip()
-            if content.startswith("```"):
-                content = re.sub(r"^```(?:json)?\s*\n?", "", content)
-                content = re.sub(r"\n?```\s*$", "", content)
-            json_match = re.search(r"\{.*\}", content, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-            return json.loads(content)
-        except Exception as e:
-            return {"score": 0, "failure_modes": ["judge-error"], "reasoning": f"Error: {e}"}
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt > 0:
+                    print(f"    Retry {attempt}/{max_retries}...")
+                    time.sleep(1)  # Brief pause before retry
+                
+                response = client.chat.completions.create(
+                    model=judge_model,
+                    messages=[{"role": "user", "content": content_parts}],
+                    max_tokens=2048,  # Increased to avoid truncation
+                    temperature=0.0,
+                )
+                raw_content = response.choices[0].message.content
+                if raw_content is None or len(raw_content.strip()) == 0:
+                    print(f"    Attempt {attempt}: Empty response")
+                    last_error = "Empty response"
+                    continue
+                    
+                raw_content = raw_content.strip()
+                print(f"    Response length: {len(raw_content)}, first 300 chars: {raw_content[:300]}")
+                
+                # Strip markdown code blocks
+                content = raw_content
+                if content.startswith("```"):
+                    content = re.sub(r"^```(?:json)?\s*\n?", "", content)
+                    content = re.sub(r"\n?```\s*$", "", content)
+                
+                # Find JSON object - handle nested braces for failure_modes array
+                json_match = re.search(r"\{[^{}]*(?:\[[^\[\]]*\][^{}]*)*\}", content, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group()
+                    # Fix newlines in string values (common issue with reasoning field)
+                    json_str = re.sub(r'(?<=: ")(.*?)(?=")', lambda m: m.group(1).replace('\n', ' ').replace('\r', ''), json_str, flags=re.DOTALL)
+                    try:
+                        parsed = json.loads(json_str)
+                        if "score" in parsed:
+                            print(f"    Parsed score: {parsed.get('score')}")
+                            return parsed
+                        else:
+                            print(f"    JSON missing 'score' field: {parsed}")
+                            last_error = "Missing score field"
+                            continue
+                    except json.JSONDecodeError as e:
+                        print(f"    JSON parse failed after cleanup: {e}")
+                        last_error = f"JSON parse error: {e}"
+                        continue
+                
+                # Try parsing the whole content as JSON
+                try:
+                    parsed = json.loads(content)
+                    if "score" in parsed:
+                        print(f"    Parsed score: {parsed.get('score')}")
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+                
+                # If we got text but no valid JSON, the model didn't follow format
+                print(f"    No valid JSON found in response")
+                last_error = f"No JSON in response: {raw_content[:100]}..."
+                continue
+                
+            except json.JSONDecodeError as e:
+                print(f"    JSON parse error: {e}")
+                last_error = f"JSON parse error: {e}"
+                continue
+            except Exception as e:
+                print(f"    API error: {type(e).__name__}: {e}")
+                last_error = f"API error: {e}"
+                continue
+        
+        # All retries failed
+        return {"score": 0, "failure_modes": ["judge-error"], "reasoning": f"After {max_retries+1} attempts: {last_error}"}
 
     def generate_response(model, tokenizer, question: str, max_new_tokens: int = 4096, use_chat_template: bool = False) -> str:
         """Generate response from model.
@@ -337,19 +403,22 @@ Respond in EXACTLY this JSON format:
         lora_model,
         lora_tokenizer,
         samples: list[dict],
-        output_dir: str,
+        output_base_dir: str,
         openrouter_client,
         config: EvalConfig,
     ) -> dict:
         """Run side-by-side evaluation comparing base and LoRA models."""
-        os.makedirs(output_dir, exist_ok=True)
-        screenshots_dir = os.path.join(output_dir, "screenshots")
-        os.makedirs(screenshots_dir, exist_ok=True)
-
         # Initialize W&B with comparison run
         base_short = config.base_model.split("/")[-1]
         lora_short = config.lora_model.split("/")[-1]
         run_name = f"comparison-{base_short}-vs-{lora_short}-{time.strftime('%m%d-%H%M')}"
+        
+        # Create run-specific output directory to avoid accumulating results
+        output_dir = os.path.join(output_base_dir, run_name)
+        os.makedirs(output_dir, exist_ok=True)
+        screenshots_dir = os.path.join(output_dir, "screenshots")
+        os.makedirs(screenshots_dir, exist_ok=True)
+        print(f"Output directory: {output_dir}")
         run = wandb.init(
             project=config.wandb_project,
             name=run_name,
@@ -424,9 +493,10 @@ Respond in EXACTLY this JSON format:
 
             # Screenshots
             print("  Rendering screenshots...")
-            render_screenshot(base_path, base_img, browser)
-            render_screenshot(lora_path, lora_img, browser)
-            render_screenshot(gt_path, gt_img, browser)
+            base_ss_ok = render_screenshot(base_path, base_img, browser)
+            lora_ss_ok = render_screenshot(lora_path, lora_img, browser)
+            gt_ss_ok = render_screenshot(gt_path, gt_img, browser)
+            print(f"  Screenshot results: base={base_ss_ok}, lora={lora_ss_ok}, gt={gt_ss_ok}")
 
             # Judge both outputs
             base_judgment = {}
@@ -535,10 +605,30 @@ Respond in EXACTLY this JSON format:
     if config.use_judge:
         openrouter_key = os.getenv("OPENROUTER_API_KEY")
         if openrouter_key:
+            # Mask key for logging (show first 8 and last 4 chars)
+            masked_key = f"{openrouter_key[:8]}...{openrouter_key[-4:]}" if len(openrouter_key) > 12 else "***"
+            print(f"OpenRouter API key found: {masked_key}")
+            
             openrouter_client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=openrouter_key)
             print(f"Judge: {config.judge_model}")
+            
+            # Test the API connection with a simple request
+            print("Testing OpenRouter API connection...")
+            try:
+                test_response = openrouter_client.chat.completions.create(
+                    model=config.judge_model,
+                    messages=[{"role": "user", "content": "Reply with just the word 'OK'"}],
+                    max_tokens=10,
+                    temperature=0.0,
+                )
+                test_content = test_response.choices[0].message.content.strip()
+                print(f"  API test successful! Response: {test_content}")
+            except Exception as e:
+                print(f"  WARNING: API test failed: {e}")
+                print("  Continuing anyway, but judge calls may fail...")
         else:
-            print("WARNING: No OPENROUTER_API_KEY, disabling judge")
+            print("WARNING: No OPENROUTER_API_KEY found in environment, disabling judge")
+            print("  Available env vars:", [k for k in os.environ.keys() if 'KEY' in k or 'SECRET' in k or 'TOKEN' in k])
             config.use_judge = False
 
     # ---------------------------------------------------------------------------
@@ -577,11 +667,11 @@ Respond in EXACTLY this JSON format:
     print("RUNNING SIDE-BY-SIDE COMPARISON")
     print("=" * 60)
     
-    output_dir = os.path.join(config.output_base_dir, "comparison")
+    # Pass the base output directory - run_comparison_eval will create run-specific subfolder
     results = run_comparison_eval(
         base_model, base_tokenizer,
         lora_model, lora_tokenizer,
-        samples, output_dir,
+        samples, config.output_base_dir,
         openrouter_client, config
     )
 
@@ -611,15 +701,86 @@ Respond in EXACTLY this JSON format:
 
 
 @app.function(
+    image=modal.Image.debian_slim(python_version="3.11").pip_install("openai"),
+    timeout=120,
+    secrets=[modal.Secret.from_name("openrouter-secret")],
+)
+def test_openrouter_api(judge_model: str = "google/gemini-3-pro-preview"):
+    """Test OpenRouter API connection from Modal.
+    
+    Run with: modal run finetuning/modal_eval.py::test_openrouter_api
+    """
+    import os
+    from openai import OpenAI
+    
+    OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+    
+    print("=" * 60)
+    print("Testing OpenRouter API from Modal")
+    print("=" * 60)
+    
+    # Check environment variables
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    print(f"\nEnvironment variables with KEY/SECRET/TOKEN:")
+    for k in sorted(os.environ.keys()):
+        if any(x in k.upper() for x in ['KEY', 'SECRET', 'TOKEN', 'API']):
+            v = os.environ[k]
+            masked = f"{v[:8]}...{v[-4:]}" if len(v) > 12 else "***"
+            print(f"  {k}: {masked}")
+    
+    if not openrouter_key:
+        print("\nERROR: OPENROUTER_API_KEY not found!")
+        print("Make sure the modal secret 'openrouter-secret' contains OPENROUTER_API_KEY")
+        return {"success": False, "error": "No API key"}
+    
+    print(f"\nAPI key found: {openrouter_key[:8]}...{openrouter_key[-4:]}")
+    print(f"Judge model: {judge_model}")
+    
+    # Test API
+    print("\nTesting API connection...")
+    client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=openrouter_key)
+    
+    try:
+        response = client.chat.completions.create(
+            model=judge_model,
+            messages=[{"role": "user", "content": "Reply with just: OK"}],
+            max_tokens=10,
+            temperature=0.0,
+        )
+        content = response.choices[0].message.content.strip()
+        print(f"Response: {content}")
+        print("\nSUCCESS: OpenRouter API is working!")
+        return {"success": True, "response": content}
+    except Exception as e:
+        print(f"\nERROR: {type(e).__name__}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.function(
     image=modal.Image.debian_slim(python_version="3.11"),
     volumes={"/results": results_vol},
     timeout=600,
 )
-def list_results():
-    """List all files in the results volume."""
+def list_results(run_name: str = None):
+    """List files in the results volume.
+    
+    Args:
+        run_name: If provided, only list files from this run's subfolder.
+                  If None, list all files (legacy behavior).
+    """
     import os
+    
+    if run_name:
+        base_path = f"/results/{run_name}"
+    else:
+        base_path = "/results"
+    
+    if not os.path.exists(base_path):
+        print(f"Path does not exist: {base_path}")
+        return []
+    
     files = []
-    for root, dirs, filenames in os.walk("/results"):
+    for root, dirs, filenames in os.walk(base_path):
         for f in filenames:
             path = os.path.join(root, f)
             files.append(path)
@@ -700,16 +861,20 @@ def main(
     # Download results from Modal volume to local
     print(f"\nDownloading results to {output_dir}/...")
     
-    files = list_results.remote()
-    print(f"Found {len(files)} files in Modal volume")
+    # Only download files from the current run's folder
+    files = list_results.remote(run_name=run_name)
+    print(f"Found {len(files)} files for run '{run_name}' in Modal volume")
     
     # Create local directory
     os.makedirs(output_dir, exist_ok=True)
     
     downloaded = 0
     for remote_path in files:
-        # Convert /results/comparison/... to local path
-        relative_path = remote_path.replace("/results/", "")
+        # Convert /results/{run_name}/... to local path (strip /results/{run_name}/ prefix)
+        if run_name:
+            relative_path = remote_path.replace(f"/results/{run_name}/", "")
+        else:
+            relative_path = remote_path.replace("/results/", "")
         local_path = os.path.join(output_dir, relative_path)
         
         # Create parent directories
