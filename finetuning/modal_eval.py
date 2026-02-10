@@ -1,17 +1,17 @@
 """
 Evaluate UI/UX code generation on Modal with GPU.
 
-Compares a base model against a finetuned LoRA model on the same test data.
+Compares a base model against a finetuned Finetuned model on the same test data.
 Both runs are logged to W&B for easy comparison.
 
 Usage:
-    # Evaluate both base and LoRA models (default: 20 samples)
+    # Evaluate both base and Finetuned models (default: 20 samples)
     modal run finetuning/modal_eval.py
 
     # Custom limit
     modal run finetuning/modal_eval.py --limit 50
 
-    # Only evaluate LoRA model
+    # Only evaluate Finetuned model
     modal run finetuning/modal_eval.py --lora-only
 
     # Only evaluate base model
@@ -87,7 +87,7 @@ class EvalConfig:
     ],
 )
 def run_evaluation(config: EvalConfig):
-    """Run evaluation on both base and LoRA models."""
+    """Run evaluation on both base and Finetuned models."""
     import os
     import json
     import time
@@ -124,11 +124,11 @@ def run_evaluation(config: EvalConfig):
 </html>
 """
 
-    # Card template for 3-column comparison: Ground Truth | Base Generation | LoRA Generation
+    # Card template for 3-column comparison: Ground Truth | Base Generation | Finetuned Generation
     WANDB_CARD_TEMPLATE = """\
 <div style="font-family: system-ui, -apple-system, sans-serif; width: 100%; box-sizing: border-box;">
   <div style="background: #f8f9fa; border-radius: 8px; padding: 16px; margin-bottom: 16px;">
-    <div style="font-size: 14px; color: #666; margin-bottom: 4px;">ID: {sample_id} &bull; Base Score: {base_score}/10 &bull; LoRA Score: {lora_score}/10</div>
+    <div style="font-size: 14px; color: #666; margin-bottom: 4px;">ID: {sample_id} &bull; Base Score: {base_score}/10 &bull; Finetuned Score: {lora_score}/10</div>
     <div style="font-size: 16px; font-weight: 600; color: #1a1a1a;">{prompt}</div>
   </div>
   <div style="display: flex; gap: 16px; margin-bottom: 16px; width: 100%;">
@@ -141,7 +141,7 @@ def run_evaluation(config: EvalConfig):
       <img src="data:image/png;base64,{base_b64}" style="width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px;" />
     </div>
     <div style="flex: 1; min-width: 0;">
-      <div style="font-size: 14px; font-weight: 600; color: #9b59b6; margin-bottom: 8px;">LoRA Model</div>
+      <div style="font-size: 14px; font-weight: 600; color: #9b59b6; margin-bottom: 8px;">Finetuned Model</div>
       <img src="data:image/png;base64,{lora_b64}" style="width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px;" />
     </div>
   </div>
@@ -151,8 +151,8 @@ def run_evaluation(config: EvalConfig):
       <span style="font-weight: 600; color: #3498db;">Base Reasoning:</span> {base_reasoning}
     </div>
     <div>
-      <span style="font-weight: 600; color: #9b59b6;">LoRA Failure Modes:</span> {lora_failure_modes}<br/>
-      <span style="font-weight: 600; color: #9b59b6;">LoRA Reasoning:</span> {lora_reasoning}
+      <span style="font-weight: 600; color: #9b59b6;">Finetuned Failure Modes:</span> {lora_failure_modes}<br/>
+      <span style="font-weight: 600; color: #9b59b6;">Finetuned Reasoning:</span> {lora_reasoning}
     </div>
   </div>
 </div>"""
@@ -407,7 +407,7 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
         openrouter_client,
         config: EvalConfig,
     ) -> dict:
-        """Run side-by-side evaluation comparing base and LoRA models."""
+        """Run side-by-side evaluation comparing base and Finetuned models."""
         # Initialize W&B with comparison run
         base_short = config.base_model.split("/")[-1]
         lora_short = config.lora_model.split("/")[-1]
@@ -455,8 +455,8 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
                 print(f"  BASE ERROR: {e}")
                 base_raw = f"ERROR: {e}"
 
-            # Generate from LoRA model
-            print("  Generating from LoRA model...")
+            # Generate from Finetuned model
+            print("  Generating from Finetuned model...")
             try:
                 lora_raw = generate_response(lora_model, lora_tokenizer, question, use_chat_template=False)
             except Exception as e:
@@ -468,7 +468,7 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
             lora_extracted = extract_code(lora_raw)
             
             base_html = wrap_in_html(base_extracted, f"Base-{sample_id}")
-            lora_html = wrap_in_html(lora_extracted, f"LoRA-{sample_id}")
+            lora_html = wrap_in_html(lora_extracted, f"Finetuned-{sample_id}")
             gt_html = wrap_in_html(reference, f"GT-{sample_id}")
 
             # Save files
@@ -511,13 +511,13 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
                 base_judgments.append(base_judgment)
                 print(f"  Base Score: {base_judgment.get('score', '?')}/10")
 
-                print("  Judging LoRA model output...")
+                print("  Judging Finetuned model output...")
                 lora_judgment = judge_output(
                     openrouter_client, config.judge_model,
                     question, lora_extracted, reference, lora_img, gt_img
                 )
                 lora_judgments.append(lora_judgment)
-                print(f"  LoRA Score: {lora_judgment.get('score', '?')}/10")
+                print(f"  Finetuned Score: {lora_judgment.get('score', '?')}/10")
 
                 # Log 3-column comparison to W&B
                 card_html = WANDB_CARD_TEMPLATE.format(
@@ -569,7 +569,7 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
         
         print(f"\n{'='*40}")
         print(f"Base Model Avg Score: {base_avg:.1f}/10")
-        print(f"LoRA Model Avg Score: {lora_avg:.1f}/10")
+        print(f"Finetuned Model Avg Score: {lora_avg:.1f}/10")
         print(f"Improvement: {lora_avg - base_avg:+.1f}")
         print(f"{'='*40}")
 
@@ -588,7 +588,7 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     print("UIUX Evaluation on Modal - Side-by-Side Comparison")
     print("=" * 60)
     print(f"Base model: {config.base_model}")
-    print(f"LoRA model: {config.lora_model}")
+    print(f"Finetuned model: {config.lora_model}")
     print(f"HF Dataset: {config.hf_dataset}")
     print(f"Limit: {config.limit}")
     print(f"Use judge: {config.use_judge}")
@@ -648,17 +648,17 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     FastLanguageModel.for_inference(base_model)
     print("Base model loaded!")
 
-    # Load LoRA model
-    print(f"Loading LoRA model: {config.lora_model}")
+    # Load Finetuned model
+    print(f"Loading Finetuned model: {config.lora_model}")
     lora_model, _ = FastLanguageModel.from_pretrained(
         model_name=config.lora_model,
         max_seq_length=4096,
         load_in_4bit=True,
     )
-    # Load tokenizer from base model (LoRA was trained on base model)
+    # Load tokenizer from base model (Finetuned was trained on base model)
     lora_tokenizer = AutoTokenizer.from_pretrained(config.base_model)
     FastLanguageModel.for_inference(lora_model)
-    print("LoRA model loaded!")
+    print("Finetuned model loaded!")
 
     # ---------------------------------------------------------------------------
     # Run Side-by-Side Comparison Evaluation
@@ -686,7 +686,7 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
         print(f"Base Model Score: {results['base_avg_score']:.1f}/10")
     
     if results.get("lora_avg_score") is not None:
-        print(f"LoRA Model Score: {results['lora_avg_score']:.1f}/10")
+        print(f"Finetuned Model Score: {results['lora_avg_score']:.1f}/10")
     
     if results.get("base_avg_score") is not None and results.get("lora_avg_score") is not None:
         diff = results["lora_avg_score"] - results["base_avg_score"]
@@ -812,7 +812,7 @@ def main(
     This will generate a 3-column comparison in W&B:
     - Column 1: Ground Truth
     - Column 2: Base Model Generation
-    - Column 3: LoRA Model Generation
+    - Column 3: Finetuned Model Generation
     
     Results are downloaded to a subfolder named after the W&B run name
     to avoid overwriting previous evaluations.
@@ -821,7 +821,7 @@ def main(
         limit: Number of samples to evaluate
         no_judge: Skip LLM judging
         base_model: Base model to compare
-        lora_model: LoRA model to compare
+        lora_model: Finetuned model to compare
         download_only: Only download existing results (skip evaluation)
         local_output: Base directory to save results (subfolder created per run)
     """
@@ -840,7 +840,7 @@ def main(
         
         print("Starting UIUX side-by-side comparison evaluation on Modal...")
         print(f"  Base model: {config.base_model}")
-        print(f"  LoRA model: {config.lora_model}")
+        print(f"  Finetuned model: {config.lora_model}")
         print(f"  Limit: {config.limit}")
         print(f"  Use judge: {config.use_judge}")
         
