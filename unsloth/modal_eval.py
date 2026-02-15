@@ -132,15 +132,15 @@ def run_evaluation(config: EvalConfig):
     <div style="font-size: 16px; font-weight: 600; color: #1a1a1a;">{prompt}</div>
   </div>
   <div style="display: flex; gap: 16px; margin-bottom: 16px; width: 100%;">
-    <div style="flex: 1; min-width: 0;">
+    <div style="flex: 1; min-width: 0; text-align: center;">
       <div style="font-size: 14px; font-weight: 600; color: #27ae60; margin-bottom: 8px;">Ground Truth</div>
       <img src="data:image/png;base64,{gt_b64}" style="width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px;" />
     </div>
-    <div style="flex: 1; min-width: 0;">
+    <div style="flex: 1; min-width: 0; text-align: center;">
       <div style="font-size: 14px; font-weight: 600; color: #3498db; margin-bottom: 8px;">Base Model</div>
       <img src="data:image/png;base64,{base_b64}" style="width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px;" />
     </div>
-    <div style="flex: 1; min-width: 0;">
+    <div style="flex: 1; min-width: 0; text-align: center;">
       <div style="font-size: 14px; font-weight: 600; color: #9b59b6; margin-bottom: 8px;">Finetuned Model</div>
       <img src="data:image/png;base64,{lora_b64}" style="width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px;" />
     </div>
@@ -157,8 +157,22 @@ def run_evaluation(config: EvalConfig):
   </div>
 </div>"""
 
-    JUDGE_PROMPT = """\
+    # ---------------------------------------------------------------------------
+    # Helper Functions
+    # ---------------------------------------------------------------------------
+    def build_judge_content(prompt, model_output, reference, gen_img, gt_img):
+        """Build content parts for the judge API message.
+
+        Structure: text (intro + GENERATION_IMAGE label) → image → text (GROUND_TRUTH_IMAGE label) → image → text (instructions).
+        """
+        # 10k chars each: typical UI HTML is 6–8k; avoid truncating scripts/closing tags
+        model_output_text = model_output #model_output[:10000]
+        reference_text = reference #reference[:10000]
+
+        part_before_gen_image = f"""\
 You are a UI code quality judge. Rate the generation from 1-10.
+
+EVALUATION: Use the generation and ground truth screenshots to compare the rendered UI and evaluate visual quality. **First check the screenshots** to see how the UI actually renders, **then check the code** for implementation details (framework, syntax, etc.).
 
 SCORING RUBRIC (start at 10, subtract for issues):
 - broken-code (-4): syntax errors, blank page, no output
@@ -171,21 +185,57 @@ SCORING RUBRIC (start at 10, subtract for issues):
 TASK: {prompt}
 
 GENERATION:
-{model_output}
+{model_output_text}
 
 GROUND TRUTH:
-{reference}
+{reference_text}
+
+GENERATION_IMAGE:
+Rendered screenshot of the GENERATION code above. Use this to evaluate the visual output.
+"""
+
+        part_between_images = """
+
+GROUND_TRUTH_IMAGE:
+Rendered screenshot of the GROUND TRUTH reference above. Use this to compare against.
+"""
+
+        part_after_images = """
 
 IMPORTANT: You MUST respond with ONLY a valid JSON object. No other text before or after.
 Do not explain your reasoning outside the JSON. Put all reasoning inside the "reasoning" field.
 
 ```json
-{{"score": <1-10>, "failure_modes": ["<mode1>", "<mode2>"], "reasoning": "<brief explanation with penalty math>"}}
-```"""
+{"score": <1-10>, "failure_modes": ["<mode1>", "<mode2>"], "reasoning": "<brief explanation with penalty math>"}
+```
+"""
 
-    # ---------------------------------------------------------------------------
-    # Helper Functions
-    # ---------------------------------------------------------------------------
+        content_parts = [{"type": "text", "text": part_before_gen_image}]
+
+        gen_exists = gen_img and os.path.exists(gen_img)
+        if gen_exists:
+            gen_b64 = image_to_base64(gen_img)
+            if gen_b64:
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{gen_b64}"},
+                })
+
+        content_parts.append({"type": "text", "text": part_between_images})
+
+        gt_exists = gt_img and os.path.exists(gt_img)
+        if gt_exists:
+            gt_b64 = image_to_base64(gt_img)
+            if gt_b64:
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{gt_b64}"},
+                })
+
+        content_parts.append({"type": "text", "text": part_after_images})
+
+        return content_parts
+
     # Prompt template matching the training format
     PROMPT_TEMPLATE = "# Task: Generate HTML/CSS code using Tailwind CSS\n# Requirements: {requirements}\n\n"
     
@@ -266,34 +316,10 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
         return ""
 
     def judge_output(client, judge_model, prompt, model_output, reference, gen_img, gt_img, max_retries: int = 2) -> dict:
-        judge_text = JUDGE_PROMPT.format(
-            prompt=prompt,
-            model_output=model_output[:4000],
-            reference=reference[:4000],
-        )
-        content_parts = [{"type": "text", "text": judge_text}]
-        
-        # Debug: check if images exist
+        content_parts = build_judge_content(prompt, model_output, reference, gen_img, gt_img)
         gen_exists = gen_img and os.path.exists(gen_img)
         gt_exists = gt_img and os.path.exists(gt_img)
         print(f"    Images: gen={gen_exists}, gt={gt_exists}")
-        
-        if gen_exists:
-            gen_b64 = image_to_base64(gen_img)
-            if gen_b64:
-                content_parts.append({"type": "text", "text": "\n\nGeneration screenshot:"})
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{gen_b64}"},
-                })
-        if gt_exists:
-            gt_b64 = image_to_base64(gt_img)
-            if gt_b64:
-                content_parts.append({"type": "text", "text": "\n\nGround truth screenshot:"})
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{gt_b64}"},
-                })
 
         last_error = None
         for attempt in range(max_retries + 1):
@@ -301,18 +327,30 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
                 if attempt > 0:
                     print(f"    Retry {attempt}/{max_retries}...")
                     time.sleep(1)  # Brief pause before retry
-                
+
+                # Gemini 3 requires reasoning and cannot disable it. Use large max_tokens so
+                # the model has room for both reasoning tokens and the final JSON output.
                 response = client.chat.completions.create(
                     model=judge_model,
                     messages=[{"role": "user", "content": content_parts}],
-                    max_tokens=2048,  # Increased to avoid truncation
+                    max_tokens=8192,  # Room for reasoning + final output (Gemini 3 mandates reasoning)
                     temperature=0.0,
                 )
                 raw_content = response.choices[0].message.content
-                if raw_content is None or len(raw_content.strip()) == 0:
-                    print(f"    Attempt {attempt}: Empty response")
-                    last_error = "Empty response"
-                    continue
+                if raw_content is None or len((raw_content or "").strip()) == 0:
+                    # Fallback: some reasoning models put output in reasoning_details
+                    msg = response.choices[0].message
+                    reasoning = getattr(msg, "reasoning", None) or ""
+                    if not reasoning and hasattr(msg, "reasoning_details") and msg.reasoning_details:
+                        for rd in msg.reasoning_details:
+                            if getattr(rd, "text", None):
+                                reasoning += rd.text or ""
+                    if reasoning and "score" in reasoning:
+                        raw_content = reasoning
+                    else:
+                        print(f"    Attempt {attempt}: Empty response")
+                        last_error = "Empty response"
+                        continue
                     
                 raw_content = raw_content.strip()
                 print(f"    Response length: {len(raw_content)}, first 300 chars: {raw_content[:300]}")

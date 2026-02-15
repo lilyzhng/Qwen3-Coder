@@ -1,0 +1,1 @@
+1. I think it's very important to have iteration. So when the judge reviewer issues constructed feedback, the model should pick it up and update it properly.So basically the model needs to learn what is a good design and what is a bad design as a negative example.

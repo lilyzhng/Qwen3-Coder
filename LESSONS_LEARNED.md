@@ -1,5 +1,20 @@
 # Lessons Learned - Qwen3-Coder Fine-tuning
 
+## Train with 100 samples
+```python
+modal run --detach unsloth/modal_coder_base.py \
+  --dataset-name lilyzhng/uigen-ui-code-gen-full \
+  --train-size 100 \
+  --num-epochs 1 \
+  --max-steps -1
+```
+## Eval with 2 models side by side
+```python 
+modal run --detach finetuning/modal_eval.py \
+   --lora-model lilyzhng/Qwen2.5-Coder-14B-r32-20260210-204233 \
+   --limit 1
+```
+
 ## Modal Job Management
 
 ### Issue: Local Client Disconnects During Long-Running Jobs
