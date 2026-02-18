@@ -13,14 +13,14 @@ Key differences from standard Unsloth:
 - grouped_mm backend for best H100/H200 performance
 
 Usage:
-    # Quick test (30 steps) on H100
+    # Quick test (30 steps) on B200 (192GB — only GPU that fits this model at bf16)
     modal run --detach Qwen3-Coder/unsloth/modal_coder_moe.py \
       --dataset-name lilyzhng/uigen-ui-code-gen --max-steps 30
 
-    # Full training (1 epoch) on H200
+    # Full training (1 epoch) on B200
     modal run --detach Qwen3-Coder/unsloth/modal_coder_moe.py \
       --dataset-name lilyzhng/uigen-ui-code-gen \
-      --num-epochs 1 --max-steps -1 --gpu-type H200
+      --num-epochs 1 --max-steps -1
 """
 
 from dataclasses import dataclass
@@ -79,15 +79,15 @@ MAX_RETRIES = 1
 class TrainingConfig:
     # Model - 80B MoE, 3B active params, 512 experts (10 active + 1 shared)
     model_name: str = 'Qwen/Qwen3-Coder-Next-Base'
-    max_seq_length: int = 4096
+    max_seq_length: int = 2048
 
     # IMPORTANT: MoE models do NOT support 4-bit quantization
     load_in_4bit: bool = False  # Must be False for MoE
     dtype: str = 'bfloat16'  # Use bf16 for better precision with MoE
 
     # LoRA - Unsloth MoE recommendations
-    lora_r: int = 32  # 16-64 range, 32 is good balance
-    lora_alpha: int = 64  # Unsloth recommends lora_r * 2 for faster training
+    lora_r: int = 8
+    lora_alpha: int = 16  # lora_r * 2
     lora_dropout: float = 0.0
     target_modules: list = None  # Will be set in __post_init__
 
@@ -110,7 +110,7 @@ class TrainingConfig:
     save_steps: int = 50
 
     # Hardware
-    gpu_type: str = 'H100'  # H100 or H200
+    gpu_type: str = 'B200'  # B200 (192GB) — only GPU that fits 80B MoE at bf16 (~163GB)
 
     # HuggingFace Upload
     push_to_hub: bool = True
@@ -219,9 +219,26 @@ def finetune_h200(config: TrainingConfig):
     return _finetune_impl(config)
 
 
+@app.function(
+    image=train_image,
+    gpu='B200',
+    volumes={
+        '/model_cache': model_cache_vol,
+        '/checkpoints': checkpoint_vol,
+    },
+    secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
+    timeout=TIMEOUT_HOURS * 60 * 60,
+    retries=modal.Retries(initial_delay=0.0, max_retries=MAX_RETRIES),
+)
+def finetune_b200(config: TrainingConfig):
+    """Run MoE fine-tuning with Unsloth on B200 (192GB — fits 80B MoE at bf16)."""
+    return _finetune_impl(config)
+
+
 _gpu_functions = {
     'H100': finetune_h100,
     'H200': finetune_h200,
+    'B200': finetune_b200,
 }
 
 
@@ -341,6 +358,27 @@ def _finetune_impl(config: TrainingConfig):
         save_steps=config.save_steps,
         save_strategy='steps',
     )
+
+    # Patch fix_untrained_tokens to handle meta tensors (large MoE models offload
+    # lm_head to CPU/meta via accelerate; unsloth_zoo tries .cpu() on it and crashes)
+    import sys
+    import unsloth_zoo.tokenizer_utils as _tok_utils
+    _orig_fix_untrained = _tok_utils.fix_untrained_tokens
+
+    def _safe_fix_untrained_tokens(*args, **kwargs):
+        try:
+            return _orig_fix_untrained(*args, **kwargs)
+        except NotImplementedError as e:
+            if 'meta tensor' in str(e):
+                print('  [Skipping fix_untrained_tokens — lm_head on meta device, expected for large MoE]')
+            else:
+                raise
+
+    _tok_utils.fix_untrained_tokens = _safe_fix_untrained_tokens
+    # Also update the name in the compiled cache module (imported via `from ... import`)
+    for _mod in sys.modules.values():
+        if getattr(_mod, 'fix_untrained_tokens', None) is _orig_fix_untrained:
+            _mod.fix_untrained_tokens = _safe_fix_untrained_tokens
 
     # Create trainer (NO response masking for base models)
     print('Initializing SFTTrainer...')
@@ -492,14 +530,14 @@ def main(
     Launch Qwen3-Coder-Next-Base MoE fine-tuning with Unsloth on Modal.
 
     Examples:
-        # Quick test (30 steps)
+        # Quick test (30 steps) on B200
         modal run --detach Qwen3-Coder/unsloth/modal_coder_moe.py \\
           --dataset-name lilyzhng/uigen-ui-code-gen
 
-        # Full epoch on H200
+        # Full epoch on B200
         modal run --detach Qwen3-Coder/unsloth/modal_coder_moe.py \\
           --dataset-name lilyzhng/uigen-ui-code-gen \\
-          --num-epochs 1 --max-steps -1 --gpu-type H200
+          --num-epochs 1 --max-steps -1
     """
     config_dict = {}
     for key, val in {
@@ -548,7 +586,7 @@ def main(
     print('='*80 + '\n')
 
     if config.gpu_type not in _gpu_functions:
-        raise ValueError(f'Unknown GPU type: {config.gpu_type}. Must be H100 or H200')
+        raise ValueError(f'Unknown GPU type: {config.gpu_type}. Must be H100, H200, or B200')
 
     print(f'Launching on Modal with {config.gpu_type}...\n')
     experiment = _gpu_functions[config.gpu_type].remote(config)
