@@ -52,6 +52,7 @@ train_image = (
         'HF_HOME': '/root/model_cache',  # NOT /model_cache — avoid volume mount shadowing
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
         'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True',
+        'USE_HF': '1',  # Force ms-swift to use HuggingFace (not ModelScope)
     })
     .run_commands(
         "python -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Coder-Next-Base', max_workers=10)\"",
@@ -216,6 +217,7 @@ def _finetune_impl(config: TrainingConfig):
     pretrain_main(PretrainArguments(
         model=config.model_name,
         dataset=[dataset_str],
+        use_hf=True,  # Use HuggingFace (not ModelScope) — match baked-in cache
 
         # LoRA configuration
         tuner_type='lora',
@@ -230,6 +232,7 @@ def _finetune_impl(config: TrainingConfig):
         bnb_4bit_quant_type='nf4',
         bnb_4bit_use_double_quant=True,
         torch_dtype='bfloat16',
+        device_map='auto',  # Allow CPU offload during loading for MoE expert conversion
 
         # Sequence length
         max_length=config.max_seq_length,
