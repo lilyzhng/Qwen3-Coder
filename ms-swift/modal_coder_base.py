@@ -238,7 +238,7 @@ def _finetune_impl(config: TrainingConfig):
         tuner_type='lora',
         lora_rank=config.lora_rank,
         lora_alpha=config.lora_alpha,
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],  # Attention only — skip MoE expert FFNs (512 experts × 3 = 1536 extra adapters)
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_up_proj', 'down_proj'],  # Attention + MoE stacked expert projections
 
         # QLoRA — 4-bit BNB quantization
         quant_method='bnb',
