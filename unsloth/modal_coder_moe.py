@@ -40,6 +40,7 @@ app = modal.App('qwen3-coder-unsloth-moe')
 # See: https://unsloth.ai/docs/basics/fine-tuning-llms-with-blackwell-rtx-50-series-and-unsloth
 train_image = (
     modal.Image.from_registry('nvidia/cuda:12.8.0-devel-ubuntu22.04', add_python='3.11')
+    .apt_install('git')
     .pip_install(
         'unsloth>=2026.2.1',  # Blackwell + transformers v5 support — NOT [cu128-torch270]
         'triton>=3.3.1',  # Required for Blackwell
