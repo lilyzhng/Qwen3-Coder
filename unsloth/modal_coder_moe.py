@@ -35,21 +35,24 @@ import modal
 # ---------------------------------------------------------------------------
 app = modal.App('qwen3-coder-unsloth-moe')
 
-# Container image with Unsloth (uses precompiled package, same as working script)
+# Container image with Unsloth for Blackwell (B200)
+# B200 requires CUDA 12.8 + Blackwell-compatible PyTorch
+# See: https://unsloth.ai/docs/basics/fine-tuning-llms-with-blackwell-rtx-50-series-and-unsloth
 train_image = (
-    modal.Image.debian_slim(python_version='3.11')
+    modal.Image.from_registry('nvidia/cuda:12.8.0-devel-ubuntu22.04', add_python='3.11')
     .pip_install(
-        'unsloth[cu128-torch270]',  # Precompiled package (no git needed)
+        'unsloth',  # Latest (2026.2.1+) supports Blackwell — NOT [cu128-torch270]
+        'triton>=3.3.1',  # Required for Blackwell
         'datasets',
         'hf-transfer',
         'wandb',
         'huggingface_hub',
     )
     .env({
-        'HF_HOME': '/model_cache',
+        'HF_HOME': '/root/model_cache',
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
         'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True',
-        'UNSLOTH_MOE_BACKEND': 'grouped_mm',  # Best for H100/H200
+        'UNSLOTH_MOE_BACKEND': 'grouped_mm',  # Best for B200
     })
 )
 
