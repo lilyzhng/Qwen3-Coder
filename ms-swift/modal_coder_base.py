@@ -78,15 +78,15 @@ class TrainingConfig:
     max_seq_length: int = 4096
 
     # LoRA
-    lora_rank: int = 32
-    lora_alpha: int = 32
+    lora_rank: int = 8
+    lora_alpha: int = 16
 
     # Training
     learning_rate: float = 2e-4
     num_epochs: int = 1
     max_steps: int = 30  # Set to -1 to use num_epochs
     batch_size: int = 1
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 1
     warmup_steps: int = 10
     weight_decay: float = 0.01
     lr_scheduler_type: str = 'cosine'
@@ -238,7 +238,7 @@ def _finetune_impl(config: TrainingConfig):
         tuner_type='lora',
         lora_rank=config.lora_rank,
         lora_alpha=config.lora_alpha,
-        target_modules='all-linear',
+        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],  # Attention only — skip MoE expert FFNs (512 experts × 3 = 1536 extra adapters)
 
         # QLoRA — 4-bit BNB quantization
         quant_method='bnb',
