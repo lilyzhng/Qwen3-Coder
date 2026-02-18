@@ -102,7 +102,7 @@ class TrainingConfig:
     save_steps: int = 50
 
     # Hardware
-    gpu_type: str = 'H200'  # H200 (141GB) — 80B MoE at 4-bit is ~41GB, plenty of headroom
+    gpu_type: str = 'B200'  # B200 (192GB) — needed for MoE expert conversion during loading (~140GB bf16 temporary)
 
     # HuggingFace Upload
     push_to_hub: bool = True
@@ -153,9 +153,23 @@ def finetune_h200(config: TrainingConfig):
     return _finetune_impl(config)
 
 
+@app.function(
+    image=train_image,
+    gpu='B200',
+    volumes={
+        '/checkpoints': checkpoint_vol,
+    },
+    secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
+    timeout=TIMEOUT_HOURS * 60 * 60,
+)
+def finetune_b200(config: TrainingConfig):
+    return _finetune_impl(config)
+
+
 _gpu_functions = {
     'H100': finetune_h100,
     'H200': finetune_h200,
+    'B200': finetune_b200,
 }
 
 
@@ -399,7 +413,7 @@ def main(
     print('=' * 80 + '\n')
 
     if config.gpu_type not in _gpu_functions:
-        raise ValueError(f'Unknown GPU type: {config.gpu_type}. Must be H100 or H200')
+        raise ValueError(f'Unknown GPU type: {config.gpu_type}. Must be H100, H200, or B200')
 
     print(f'Launching on Modal with {config.gpu_type}...\n')
     experiment = _gpu_functions[config.gpu_type].remote(config)
