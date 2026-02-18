@@ -51,7 +51,7 @@ train_image = (
     # Upgrade to transformers v5 AFTER unsloth install.
     # Unsloth PyPI pins transformers<=4.57.6 but their docs confirm v5.1.0 works.
     # v5 stores MoE experts as nn.Parameter (not ModuleList) enabling grouped_mm — ~6x faster.
-    .run_commands('pip install "transformers>=5.1.0" "trl>=0.27.1"')
+    .run_commands('pip install "transformers==5.1.0" "trl==0.27.1"')
     .env({
         'HF_HOME': '/root/model_cache',
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
