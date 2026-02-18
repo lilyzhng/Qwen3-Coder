@@ -42,14 +42,16 @@ train_image = (
     modal.Image.from_registry('nvidia/cuda:12.8.0-devel-ubuntu22.04', add_python='3.11')
     .pip_install(
         'unsloth',  # Latest (2026.2.1+) supports Blackwell — NOT [cu128-torch270]
-        # NOTE: Do NOT pin transformers>=5 — unsloth pins transformers<=4.57.6
-        # and pip will silently downgrade unsloth to an old version without Blackwell support
         'triton>=3.3.1',  # Required for Blackwell
         'datasets',
         'hf-transfer',
         'wandb',
         'huggingface_hub',
     )
+    # Upgrade to transformers v5 AFTER unsloth install.
+    # Unsloth PyPI pins transformers<=4.57.6 but their docs confirm v5.1.0 works.
+    # v5 stores MoE experts as nn.Parameter (not ModuleList) enabling grouped_mm — ~6x faster.
+    .run_commands('pip install "transformers>=5.1.0" "trl>=0.27.1"')
     .env({
         'HF_HOME': '/root/model_cache',
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
