@@ -232,7 +232,9 @@ def _finetune_impl(config: TrainingConfig):
         bnb_4bit_quant_type='nf4',
         bnb_4bit_use_double_quant=True,
         torch_dtype='bfloat16',
-        device_map='auto',  # Allow CPU offload during loading for MoE expert conversion
+        # device_map removed: Bug 11 OOM was caused by ModelScope (bf16 load), not device_map.
+        # With USE_HF=1, model loads in 4-bit (~41GB) which fits H200 (141GB) without offloading.
+        # BNB 4-bit rejects device_map='auto' if any modules land on CPU (Bug 12).
 
         # Sequence length
         max_length=config.max_seq_length,
