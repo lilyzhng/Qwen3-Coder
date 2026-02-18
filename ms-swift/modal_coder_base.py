@@ -49,19 +49,18 @@ train_image = (
     # Set CC and CXX to force use of gcc/g++ instead of clang (which isn't installed)
     .run_commands('CC=gcc CXX=g++ pip install causal-conv1d --no-build-isolation')
     .env({
-        'HF_HOME': '/model_cache',
+        'HF_HOME': '/root/model_cache',  # NOT /model_cache — avoid volume mount shadowing
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
         'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True',
     })
     .run_commands(
-        'huggingface-cli download Qwen/Qwen3-Coder-Next-Base --max-workers 10',
+        "python -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Coder-Next-Base', max_workers=10)\"",
     )
 )
 
 # ---------------------------------------------------------------------------
 # Persistent volumes
 # ---------------------------------------------------------------------------
-model_cache_vol = modal.Volume.from_name('qwen-model-cache', create_if_missing=True)
 checkpoint_vol = modal.Volume.from_name('qwen-swift-checkpoints', create_if_missing=True)
 
 TIMEOUT_HOURS = 6
@@ -102,7 +101,7 @@ class TrainingConfig:
     save_steps: int = 50
 
     # Hardware
-    gpu_type: str = 'H100'  # H100 (80GB) or H200 (141GB)
+    gpu_type: str = 'H200'  # H200 (141GB) — 80B MoE at 4-bit is ~41GB, plenty of headroom
 
     # HuggingFace Upload
     push_to_hub: bool = True
@@ -131,7 +130,6 @@ class TrainingConfig:
     image=train_image,
     gpu='H100',
     volumes={
-        '/model_cache': model_cache_vol,
         '/checkpoints': checkpoint_vol,
     },
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
@@ -145,7 +143,6 @@ def finetune_h100(config: TrainingConfig):
     image=train_image,
     gpu='H200',
     volumes={
-        '/model_cache': model_cache_vol,
         '/checkpoints': checkpoint_vol,
     },
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
@@ -259,13 +256,15 @@ def _finetune_impl(config: TrainingConfig):
         report_to=['wandb'],
         run_name=config.experiment_name,
 
+        # Memory optimization
+        gradient_checkpointing=True,
+
         # Misc
         seed=config.seed,
         dataloader_num_workers=4,
     ))
 
     # Commit checkpoints to Modal volume
-    model_cache_vol.commit()
     checkpoint_vol.commit()
     print(f'\nCheckpoints saved to Modal volume: {output_dir}')
 
