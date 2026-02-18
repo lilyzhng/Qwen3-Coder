@@ -48,10 +48,13 @@ train_image = (
         'wandb',
         'huggingface_hub',
     )
-    # Upgrade to transformers v5 AFTER unsloth install.
-    # Unsloth PyPI pins transformers<=4.57.6 but their docs confirm v5.1.0 works.
-    # v5 stores MoE experts as nn.Parameter (not ModuleList) enabling grouped_mm — ~6x faster.
-    .run_commands('pip install "transformers==5.1.0" "trl==0.27.1"')
+    # Upgrade to transformers/trl dev versions AFTER unsloth install.
+    # Datta0 (Unsloth collaborator) confirmed working with transformers==5.2.0.dev0 + trl==0.29.0.dev0.
+    # Release versions (5.1.0/0.27.1) hang due to nn.Parameter + peft incompatibility.
+    .run_commands(
+        'pip install "transformers @ git+https://github.com/huggingface/transformers.git"'
+        ' "trl @ git+https://github.com/huggingface/trl.git"'
+    )
     .env({
         'HF_HOME': '/root/model_cache',
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
