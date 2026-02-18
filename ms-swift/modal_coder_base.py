@@ -36,7 +36,8 @@ train_image = (
     .apt_install('git', 'build-essential')  # build-essential includes g++ and make
     .pip_install(
         'ms-swift @ git+https://github.com/modelscope/ms-swift.git',
-        'transformers>=4.57',
+        'transformers>=4.57,<4.58',  # ms-swift requires <4.58 (see requirements/install_all.sh)
+        'trl<0.25',  # ms-swift requires <0.25
         'bitsandbytes',
         'datasets',
         'wandb',
@@ -181,12 +182,6 @@ def _finetune_impl(config: TrainingConfig):
     import os
 
     import torch
-
-    # Patch: newer transformers removed group_by_length from TrainingArguments,
-    # but ms-swift's trainer mixin accesses it at swift/trainers/mixin.py:1259.
-    from transformers import Seq2SeqTrainingArguments
-    if not hasattr(Seq2SeqTrainingArguments, 'group_by_length'):
-        Seq2SeqTrainingArguments.group_by_length = False
 
     # Print GPU info
     if torch.cuda.is_available():
