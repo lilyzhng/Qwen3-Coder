@@ -182,6 +182,12 @@ def _finetune_impl(config: TrainingConfig):
 
     import torch
 
+    # Patch: newer transformers removed group_by_length from TrainingArguments,
+    # but ms-swift's trainer mixin accesses it at swift/trainers/mixin.py:1259.
+    from transformers import Seq2SeqTrainingArguments
+    if not hasattr(Seq2SeqTrainingArguments, 'group_by_length'):
+        Seq2SeqTrainingArguments.group_by_length = False
+
     # Print GPU info
     if torch.cuda.is_available():
         gpu = torch.cuda.get_device_properties(0)
@@ -281,7 +287,6 @@ def _finetune_impl(config: TrainingConfig):
         # Misc
         seed=config.seed,
         dataloader_num_workers=4,
-        group_by_length=False,  # Newer transformers removed this attr; set explicitly for ms-swift compat
     ))
 
     # Commit checkpoints to Modal volume
