@@ -281,6 +281,7 @@ def _finetune_impl(config: TrainingConfig):
         # Misc
         seed=config.seed,
         dataloader_num_workers=4,
+        group_by_length=False,  # Newer transformers removed this attr; set explicitly for ms-swift compat
     ))
 
     # Commit checkpoints to Modal volume
