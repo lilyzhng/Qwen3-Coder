@@ -42,7 +42,9 @@ train_image = (
     modal.Image.from_registry('nvidia/cuda:12.8.0-devel-ubuntu22.04', add_python='3.11')
     .apt_install('git')
     .pip_install(
-        'unsloth>=2026.2.1',  # Blackwell + transformers v5 support — NOT [cu128-torch270]
+        # Pin torch first to match Datta0's working setup
+        'torch==2.10.0',
+        'unsloth>=2026.2.1',  # Blackwell + transformers v5 support
         'triton>=3.3.1',  # Required for Blackwell
         'datasets',
         'hf-transfer',
@@ -50,7 +52,7 @@ train_image = (
         'huggingface_hub',
     )
     # Upgrade to transformers/trl dev versions AFTER unsloth install.
-    # Datta0 (Unsloth collaborator) confirmed working with transformers==5.2.0.dev0 + trl==0.29.0.dev0.
+    # Datta0 confirmed working with transformers==5.2.0.dev0 + trl==0.29.0.dev0.
     # Release versions (5.1.0/0.27.1) hang due to nn.Parameter + peft incompatibility.
     .run_commands(
         'pip install "transformers @ git+https://github.com/huggingface/transformers.git"'
@@ -258,6 +260,14 @@ _gpu_functions = {
 # ---------------------------------------------------------------------------
 def _finetune_impl(config: TrainingConfig):
     """Run MoE fine-tuning on Modal with Unsloth (BASE model, no chat template)."""
+
+    # Print dependency versions to verify they match Datta0's working setup
+    import importlib.metadata as _meta
+    for _pkg in ['torch', 'transformers', 'trl', 'unsloth', 'unsloth-zoo']:
+        try:
+            print(f'{_pkg}: {_meta.version(_pkg)}')
+        except _meta.PackageNotFoundError:
+            print(f'{_pkg}: NOT INSTALLED')
 
     # Verify MoE backend
     moe_backend = os.environ.get('UNSLOTH_MOE_BACKEND', 'not set')
