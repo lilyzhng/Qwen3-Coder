@@ -75,7 +75,7 @@ TIMEOUT_HOURS = 6
 class TrainingConfig:
     # Model — 80B MoE, 3B active params, 512 experts (10 active + 1 shared)
     model_name: str = 'Qwen/Qwen3-Coder-Next-Base'
-    max_seq_length: int = 4096
+    max_seq_length: int = 2048
 
     # LoRA
     lora_rank: int = 8
@@ -85,7 +85,7 @@ class TrainingConfig:
     learning_rate: float = 2e-4
     num_epochs: int = 1
     max_steps: int = 30  # Set to -1 to use num_epochs
-    batch_size: int = 1
+    batch_size: int = 2
     gradient_accumulation_steps: int = 1
     warmup_steps: int = 10
     weight_decay: float = 0.01
@@ -276,8 +276,8 @@ def _finetune_impl(config: TrainingConfig):
         report_to=['wandb'],
         run_name=config.experiment_name,
 
-        # Memory optimization
-        gradient_checkpointing=True,
+        # Memory optimization — disabled: 65 GiB headroom on B200, no need to trade compute for memory
+        gradient_checkpointing=False,
 
         # Misc
         seed=config.seed,
