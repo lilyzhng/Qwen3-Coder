@@ -42,7 +42,8 @@ train_image = (
     modal.Image.from_registry('nvidia/cuda:12.8.0-devel-ubuntu22.04', add_python='3.11')
     .pip_install(
         'unsloth',  # Latest (2026.2.1+) supports Blackwell — NOT [cu128-torch270]
-        'transformers>=5.1.0',  # Unsloth MoE optimizations target transformers v5
+        # NOTE: Do NOT pin transformers>=5 — unsloth pins transformers<=4.57.6
+        # and pip will silently downgrade unsloth to an old version without Blackwell support
         'triton>=3.3.1',  # Required for Blackwell
         'datasets',
         'hf-transfer',
