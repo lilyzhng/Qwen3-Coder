@@ -67,6 +67,7 @@ train_image = (
     .run_commands(
         'pip install --no-deps "transformers @ git+https://github.com/huggingface/transformers.git"'
         ' "trl @ git+https://github.com/huggingface/trl.git"'
+        ' && pip install --upgrade huggingface_hub'
     )
     # Verify correct versions are installed (transformers >=5.x, trl >=0.28)
     .run_commands(
