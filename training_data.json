@@ -169,5 +169,26 @@
         "content": "The bottleneck is **CPU, not GPU**. Modal defaults to 1 CPU core when no `cpu=` parameter is specified. With `dataloader_num_workers=4`, four data loading workers compete for a single core, creating a data pipeline bottleneck that starves the GPU.\n\nFour fixes:\n\n**1. Request more CPU cores from Modal (biggest impact):**\n```python\n@app.function(\n    image=train_image,\n    gpu='B200',\n    cpu=8,  # Was missing — Modal defaults to 1 core\n    ...\n)\n```\n\n**2. Enable dataset packing:**\n```python\npacking=True,  # Pack multiple short samples into one 8192-token sequence\n```\nSamples range from 4k-40k chars (~1k-10k tokens). Without packing, shorter samples waste padding. With packing, multiple samples fill each 8192-token window, reducing total steps and padding overhead.\n\n**3. Increase batch size to use VRAM headroom:**\n```python\nbatch_size=4,  # Was 2 — 64 GiB VRAM headroom unused\n```\n\n**4. Match dataloader workers to CPU cores:**\n```python\ndataloader_num_workers=8,  # Match cpu=8\n```\n\n**Lesson:** Always check CPU allocation on cloud GPU platforms. A single CPU core is the most common hidden bottleneck — data loading, tokenization, and preprocessing all compete for CPU time. Low GPU utilization (below 50%) almost always indicates a CPU or I/O bottleneck, not a GPU limitation. On Modal, set `cpu=` explicitly in the function decorator."
       }
     ]
+  },
+  {
+    "bug_id": "ms-swift-18",
+    "title": "First step warmup: Unsloth vs ms-swift — different causes, different diagnostics",
+    "timestamp": "2026-02-18 20:30 PST",
+    "commit": null,
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an ML infrastructure engineer. Project: fine-tuning Qwen3-Coder-Next-Base (80B MoE, 3B active, 512 experts) on Modal using both ms-swift (QLoRA, BNB 4-bit) and Unsloth (bf16 LoRA with grouped_mm MoE backend) on B200 (192GB)."
+      },
+      {
+        "role": "user",
+        "content": "Both Unsloth and ms-swift show a slow first training step. For Unsloth, the progress bar sits at 0/90 with 0% GPU utilization for several minutes. For ms-swift, step 1 takes ~179s vs ~82s steady state. Why are the causes different, and how do you tell them apart?"
+      },
+      {
+        "role": "assistant",
+        "content": "The first step is slow in both frameworks, but for fundamentally different reasons. Understanding the difference is critical for diagnosing whether training is stuck or just warming up.\n\n**Unsloth — Triton kernel compilation (CPU-bound):**\n- Unsloth replaces standard PyTorch attention and MoE routing with custom Triton kernels (grouped_mm, flash attention, etc.)\n- These Triton kernels are JIT-compiled on first use — the compiler runs entirely on CPU\n- During compilation: **CPU utilization is high, GPU utilization is 0%**\n- The GPU sits completely idle waiting for the compiled kernels\n- Can take 5-15 minutes depending on model complexity\n- Subsequent steps reuse cached compiled kernels and are much faster\n\n**ms-swift — CUDA/BNB warmup (GPU-bound):**\n- ms-swift uses standard PyTorch + BitsAndBytes, no custom Triton kernels\n- First step overhead comes from:\n  1. CUDA context initialization (first kernel launch on the GPU)\n  2. BitsAndBytes NF4→bf16 dequantization kernels JIT-compiled on first use\n  3. PyTorch autograd graph construction (first forward+backward traces the graph)\n  4. Memory allocator warmup (expandable_segments adapts its strategy)\n- During warmup: **GPU utilization is non-zero but lower than steady state**\n- Step 1 is ~2x slower than steady state (179s vs 82s), not infinitely stalled\n\n**How to tell them apart — the diagnostic table:**\n\n| Signal | Triton compiling (Unsloth) | CUDA warmup (ms-swift) | Stuck/deadlocked |\n|---|---|---|---|\n| CPU utilization | **High** (50-100%) | Low-moderate | **~0%** |\n| GPU utilization | **0%** | **>0%** (lower than steady state) | **0%** |\n| GPU power draw | Idle (~50W) | Active (200-400W) | Idle (~50W) |\n| Duration | 5-15 min | 1-3 min | Indefinite |\n| Logs | May show 'Compiling...' | Shows training metrics after step 1 | Silent |\n\n**Key diagnostic: if both CPU and GPU are at 0%, it's stuck — not compiling, not warming up.** This is how we identified the Bug 5 hang (nn.Parameter + peft deadlock) vs normal Triton compilation.\n\n**Lesson:** Always monitor both CPU and GPU utilization on the first step. CPU-high + GPU-zero = compilation (wait). GPU-active = warmup (wait). Both zero = deadlock (kill and debug)."
+      }
+    ]
   }
 ]
