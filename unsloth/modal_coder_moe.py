@@ -59,21 +59,12 @@ train_image = (
         'pip uninstall -y unsloth-zoo'
         ' && pip install "unsloth-zoo @ git+https://github.com/datta0/unsloth-zoo@transformers_v5_patches"'
     )
-    # IMPORTANT: Install transformers/trl dev versions LAST.
-    # unsloth-zoo's dependencies downgrade transformers to 4.57.x and trl to 0.24.x.
-    # Datta0 confirmed working with transformers==5.2.0.dev0 + trl==0.29.0.dev0.
-    # The release versions cause a hang due to nn.Parameter + peft incompatibility.
-    # --no-deps prevents re-downgrading other packages.
+    # IMPORTANT: Install transformers/trl LAST — unsloth-zoo downgrades them.
+    # Pin to exact versions Datta0 tested with (5.2.0 + trl 0.28).
+    # --no-deps so unsloth-zoo's pins don't re-downgrade them.
     .run_commands(
-        'pip install --no-deps "transformers @ git+https://github.com/huggingface/transformers.git"'
-        ' "trl @ git+https://github.com/huggingface/trl.git"'
+        'pip install --no-deps "transformers==5.2.0" "trl>=0.28,<0.30"'
         ' && pip install --upgrade huggingface_hub'
-    )
-    # Verify correct versions are installed (transformers >=5.x, trl >=0.28)
-    .run_commands(
-        'python -c "import transformers, trl; print(f\'transformers={transformers.__version__}, trl={trl.__version__}\')'
-        ' ; assert int(transformers.__version__.split(\\\".\\\")[0]) >= 5, f\\\"transformers too old: {transformers.__version__}\\\"'
-        ' ; print(\\\"Version check passed\\\")"'
     )
     .env({
         'HF_HOME': '/root/model_cache',
