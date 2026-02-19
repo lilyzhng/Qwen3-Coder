@@ -60,10 +60,13 @@ train_image = (
         ' && pip install "unsloth-zoo @ git+https://github.com/datta0/unsloth-zoo@transformers_v5_patches"'
     )
     # IMPORTANT: Install transformers/trl LAST — unsloth-zoo downgrades them.
-    # Pin to exact versions Datta0 tested with (5.2.0 + trl 0.28).
-    # --no-deps so unsloth-zoo's pins don't re-downgrade them.
+    # Match Datta0's exact setup: transformers==5.2.0.dev0, trl==0.29.0.dev0.
+    # transformers 5.2.0 is released on PyPI (equivalent to dev0).
+    # trl 0.29.0 is NOT on PyPI yet — must install from git.
+    # --no-deps prevents unsloth-zoo's pins from re-downgrading.
     .run_commands(
-        'pip install --no-deps "transformers==5.2.0" "trl>=0.28,<0.30"'
+        'pip install --no-deps transformers==5.2.0'
+        ' && pip install --no-deps "trl @ git+https://github.com/huggingface/trl.git"'
         ' && pip install --upgrade huggingface_hub'
     )
     .env({
