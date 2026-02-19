@@ -51,13 +51,6 @@ train_image = (
         'wandb',
         'huggingface_hub',
     )
-    # Upgrade to transformers/trl dev versions AFTER unsloth install.
-    # Datta0 confirmed working with transformers==5.2.0.dev0 + trl==0.29.0.dev0.
-    # Release versions (5.1.0/0.27.1) hang due to nn.Parameter + peft incompatibility.
-    .run_commands(
-        'pip install "transformers @ git+https://github.com/huggingface/transformers.git"'
-        ' "trl @ git+https://github.com/huggingface/trl.git"'
-    )
     # Apply Datta0's unsloth-zoo patch for transformers v5 + MoE compatibility:
     # - Fixes nn.Parameter + peft detection (training hang fix)
     # - Adds native Qwen3-Next MoE support (qwen3_next_moe.py)
@@ -65,6 +58,21 @@ train_image = (
     .run_commands(
         'pip uninstall -y unsloth-zoo'
         ' && pip install "unsloth-zoo @ git+https://github.com/datta0/unsloth-zoo@transformers_v5_patches"'
+    )
+    # IMPORTANT: Install transformers/trl dev versions LAST.
+    # unsloth-zoo's dependencies downgrade transformers to 4.57.x and trl to 0.24.x.
+    # Datta0 confirmed working with transformers==5.2.0.dev0 + trl==0.29.0.dev0.
+    # The release versions cause a hang due to nn.Parameter + peft incompatibility.
+    # --no-deps prevents re-downgrading other packages.
+    .run_commands(
+        'pip install --no-deps "transformers @ git+https://github.com/huggingface/transformers.git"'
+        ' "trl @ git+https://github.com/huggingface/trl.git"'
+    )
+    # Verify correct versions are installed (transformers >=5.x, trl >=0.28)
+    .run_commands(
+        'python -c "import transformers, trl; print(f\'transformers={transformers.__version__}, trl={trl.__version__}\')'
+        ' ; assert int(transformers.__version__.split(\\\".\\\")[0]) >= 5, f\\\"transformers too old: {transformers.__version__}\\\"'
+        ' ; print(\\\"Version check passed\\\")"'
     )
     .env({
         'HF_HOME': '/root/model_cache',
