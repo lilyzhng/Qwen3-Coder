@@ -1,0 +1,173 @@
+[
+  {
+    "bug_id": "ms-swift-11-12-13",
+    "title": "OOM during MoE expert conversion on H200",
+    "timestamp": "2026-02-17 19:30 PST",
+    "commit": "12ba29f",
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an ML infrastructure engineer. Project: fine-tuning Qwen3-Coder-Next-Base (80B MoE, 3B active, 512 experts) on Modal cloud using ms-swift with QLoRA (BNB 4-bit NF4). GPU: H200 (141GB VRAM)."
+      },
+      {
+        "role": "user",
+        "content": "I'm getting OOM during model loading with ms-swift:\n```\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1024.00 MiB.\nGPU 0 has a total capacity of 139.80 GiB of which 43.25 MiB is free.\nError: MergeModulelist on tensors destined for model.layers.47.mlp.experts.gate_up_proj\n```\nThe model should be ~41GB at 4-bit QLoRA. Why is it using all 139GB?\n\nRelevant code:\n```python\npretrain_main(PretrainArguments(\n    model='Qwen/Qwen3-Coder-Next-Base',\n    quant_method='bnb', quant_bits=4,\n    bnb_4bit_compute_dtype='bfloat16',\n    bnb_4bit_quant_type='nf4',\n    bnb_4bit_use_double_quant=True,\n    torch_dtype='bfloat16',\n    use_hf=True,\n))\n```"
+      },
+      {
+        "role": "assistant",
+        "content": "There are two issues here.\n\n**Issue 1: ms-swift defaults to ModelScope, not HuggingFace.** Even with `use_hf=True` in PretrainArguments, ms-swift also needs the `USE_HF=1` environment variable. Without it, ms-swift downloads the model from ModelScope to `/root/.cache/modelscope/` at runtime, ignoring any model you baked into the HuggingFace cache. This wastes GPU-hours re-downloading 160GB.\n\n**Issue 2: The OOM is during MoE expert weight conversion, not training.** BNB 4-bit quantization happens AFTER weight loading. The sequence is:\n1. Individual MoE expert weights load in bf16 (~140GB total)\n2. `MergeModulelist` stacks individual expert weights into `nn.Parameter` tensors (needs +1-2GB temporary)\n3. Only THEN does BNB quantize everything to 4-bit (~41GB)\n\nH200 (141GB) has no headroom for step 2.\n\n**Fix for Issue 1:**\n```python\n# Add to Modal image env vars\n.env({'USE_HF': '1'})\n# And in PretrainArguments\nuse_hf=True,\n```"
+      },
+      {
+        "role": "user",
+        "content": "I added `USE_HF=1` and also `device_map='auto'` to allow CPU offloading during the expert conversion. Now I get:\n```\nValueError: Some modules are dispatched on the CPU or the disk. Make sure you have enough GPU RAM to fit the quantized model. If you want to dispatch the model on the CPU or the disk while keeping these modules in 32-bit, you need to set `llm_int8_enable_fp32_cpu_offload=True` and pass a custom `device_map` to `from_pretrained`.\n```"
+      },
+      {
+        "role": "assistant",
+        "content": "**Wrong path: `device_map='auto'` doesn't work with BNB 4-bit.** When `device_map='auto'` computes the device map, it sees the model is too large for GPU at bf16 and dispatches some modules to CPU. But BNB 4-bit quantization requires ALL quantized modules to be on GPU — it rejects any device map with CPU-offloaded modules.\n\nThe original OOM was caused by Issue 1 (ModelScope loading bf16 instead of using the baked-in 4-bit cache). With `USE_HF=1` now set, removing `device_map='auto'` should work... except it doesn't. Even loading from the correct HF cache, the MergeModulelist conversion still needs to hold bf16 expert weights (~140GB) temporarily before BNB quantizes them.\n\n**Fix: Use B200 (192GB) instead of H200 (141GB).** The model temporarily uses ~140GB during expert weight stacking, then BNB quantizes to ~41GB. B200 has ~30GB headroom for the conversion.\n\n```python\n# Remove device_map='auto'\n# Change default GPU\ngpu_type: str = 'B200'  # 192GB needed for MoE expert conversion during loading\n```\n\nThis is a fundamental constraint: BNB + large MoE models need enough VRAM for the bf16 temporary during loading, even though the final model is much smaller."
+      }
+    ]
+  },
+  {
+    "bug_id": "ms-swift-14",
+    "title": "transformers version incompatibility with ms-swift",
+    "timestamp": "2026-02-17 19:46 PST",
+    "commit": "9912627",
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an ML infrastructure engineer. Project: fine-tuning Qwen3-Coder-Next-Base (80B MoE) on Modal using ms-swift with QLoRA on B200."
+      },
+      {
+        "role": "user",
+        "content": "Model loaded and LoRA applied successfully (49.2M trainable of 78.9B), but training crashes:\n```\nAttributeError: 'Seq2SeqTrainingArguments' object has no attribute 'group_by_length'\n```\nAt `swift/trainers/mixin.py:1259`.\n\nImage installs:\n```python\n.pip_install(\n    'ms-swift @ git+https://github.com/modelscope/ms-swift.git',\n    'transformers>=4.57',\n)\n```"
+      },
+      {
+        "role": "assistant",
+        "content": "This is a version compatibility issue. `transformers>=4.57` pulled a version >=4.58 that removed `group_by_length` from `Seq2SeqTrainingArguments`.\n\n**Wrong path tried:** Adding `group_by_length=False` to PretrainArguments — fails because PretrainArguments doesn't accept it as a kwarg:\n```\nTypeError: PretrainArguments.__init__() got an unexpected keyword argument 'group_by_length'\n```\n\n**Wrong path tried:** Monkey-patching `Seq2SeqTrainingArguments.group_by_length = False` — fixes that error but then hits another:\n```\nAttributeError: 'Seq2SeqTrainer' object has no attribute '_nested_gather'\n```\nSame root cause — newer transformers removed multiple attributes ms-swift depends on.\n\n**Fix:** Pin transformers to the version ms-swift is tested with. Found in `requirements/install_all.sh`:\n```bash\npip install \"transformers<4.58\" \"trl<0.25\" peft -U\n```\n\nUpdated image:\n```python\n.pip_install(\n    'ms-swift @ git+https://github.com/modelscope/ms-swift.git',\n    'transformers>=4.57,<4.58',\n    'trl<0.25',\n)\n```\n\n**Lesson:** Always check a framework's own `requirements/` or `install_all.sh` for tested dependency versions, not just the minimum version in `setup.py`."
+      }
+    ]
+  },
+  {
+    "bug_id": "unsloth-5",
+    "title": "Training hangs — nn.Parameter + peft incompatibility",
+    "timestamp": "2026-02-17 19:07 PST",
+    "commit": null,
+    "path": "unsloth",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an ML infrastructure engineer. Project: fine-tuning Qwen3-Coder-Next-Base (80B MoE, 3B active, 512 experts) on Modal using Unsloth MoE with bf16 LoRA on B200 (192GB). Using unsloth==2026.2.1, transformers==5.1.0, trl==0.27.1."
+      },
+      {
+        "role": "user",
+        "content": "Model loads successfully on B200 and Unsloth banner shows correctly:\n```\nUnsloth - 2x faster free finetuning | Num GPUs used = 1\nTrainable parameters = 1,110,343,680 of 80,784,734,976 (1.37% trained)\n```\nBut training hangs at step 0/30 with 0% GPU utilization for 30+ minutes. GPU util is completely flat.\n\nConfig:\n```python\nmodel, tokenizer = FastLanguageModel.from_pretrained(\n    model_name='Qwen/Qwen3-Coder-Next-Base',\n    max_seq_length=4096,\n    dtype=torch.bfloat16,\n    load_in_4bit=False,\n)\nmodel = FastLanguageModel.get_peft_model(\n    model, r=8,\n    target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj',\n                     'gate_proj', 'up_proj', 'down_proj', 'gate_up_proj'],\n    lora_alpha=16, lora_dropout=0, bias='none',\n    use_gradient_checkpointing='unsloth',\n)\n```"
+      },
+      {
+        "role": "assistant",
+        "content": "Two issues are causing the hang:\n\n**Issue 1: Unsloth doesn't support the `qwen3_next` architecture.** Qwen3-Coder-Next-Base reports `model_type='qwen3_next'`, but Unsloth's loader (`unsloth/models/loader.py:516`) only handles `'qwen3'` and `'qwen3_moe'` (commented out). `'qwen3_next'` falls through to a generic `FastModel` path without MoE optimizations.\n\n**Issue 2: transformers v5 `nn.Parameter` breaks peft/LoRA.** Transformers v5 stores MoE expert weights as `nn.Parameter` (stacked tensors) instead of `nn.Linear`. Peft/LoRA cannot properly attach adapters to `nn.Parameter`, causing the training loop to hang at the first forward pass. Confirmed by Unsloth collaborator @Datta0 on GitHub issue #4040: 'The weights of the MOE layers are loaded as nn.Parameter which is known to not play well with peft/load_in_4bit.'\n\n**Suggested workaround (from Unsloth team):** Downgrade to `transformers==4.57.6` where MoE layers use `nn.Linear` instead of `nn.Parameter`. But this loses the `grouped_mm` speedup that was the whole reason to use Unsloth MoE.\n\n**Decision:** Abandon Unsloth for this model. Use ms-swift instead, which natively supports `qwen3_next` with proper QLoRA. Reported the issue at https://github.com/unslothai/unsloth/issues/4040."
+      }
+    ]
+  },
+  {
+    "bug_id": "unsloth-5-fix",
+    "title": "Training hang fix — dev versions of transformers/trl",
+    "timestamp": "2026-02-17 21:02 PST",
+    "commit": "dc9e168",
+    "path": "unsloth",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an ML infrastructure engineer. Project: fine-tuning Qwen3-Coder-Next-Base (80B MoE, 3B active, 512 experts) on Modal using Unsloth MoE with bf16 LoRA on B200 (192GB). Training hangs at step 0/30 with 0% GPU utilization. Using unsloth==2026.2.1, transformers==5.1.0, trl==0.27.1."
+      },
+      {
+        "role": "user",
+        "content": "An Unsloth collaborator (@Datta0) responded to my GitHub issue and shared their working setup:\n```\ntorch                             2.10.0\ntransformers                      5.2.0.dev0\ntrl                               0.29.0.dev0\nunsloth                           2026.2.1\nunsloth-zoo                       2026.2.1\n```\nThey used rank 8, seq_len 2048, batch_size 1 and training completed successfully:\n- Model load: 153.26 GiB\n- After peft: 153.58 GiB\n- Training finished: 162.32 GiB\n\nMy setup uses transformers==5.1.0 and trl==0.27.1. What's different?"
+      },
+      {
+        "role": "assistant",
+        "content": "The key difference is **transformers and trl are dev versions from git**, not PyPI releases.\n\n| Setting | Datta0 (working) | Yours (hanging) |\n|---|---|---|\n| transformers | 5.2.0.dev0 (git) | 5.1.0 (PyPI) |\n| trl | 0.29.0.dev0 (git) | 0.27.1 (PyPI) |\n| seq_len | 2048 | 4096 |\n\n`transformers==5.2.0.dev0` likely has fixes for the `nn.Parameter` + peft compatibility issue that the 5.1.0 release doesn't have yet. The dev version of trl (0.29.0.dev0) may also include necessary patches.\n\n**Fix:** Install transformers and trl from git HEAD instead of pinning release versions:\n```python\n.run_commands(\n    'pip install \"transformers @ git+https://github.com/huggingface/transformers.git\"'\n    ' \"trl @ git+https://github.com/huggingface/trl.git\"'\n)\n```\n\n**Lesson:** When a framework collaborator shares a working setup with `.dev0` versions, it means they're using unreleased fixes from git HEAD. PyPI releases may lag behind, especially for cutting-edge features like MoE nn.Parameter support."
+      }
+    ]
+  },
+  {
+    "bug_id": "ms-swift-15",
+    "title": "Slow training — LoRA on all-linear targets with MoE model",
+    "timestamp": "2026-02-17 22:30 PST",
+    "commit": "85b99cf",
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an ML infrastructure engineer. Project: fine-tuning Qwen3-Coder-Next-Base (80B MoE, 3B active, 512 experts) on Modal using ms-swift with QLoRA (BNB 4-bit NF4) on B200 (192GB)."
+      },
+      {
+        "role": "user",
+        "content": "Training started successfully on B200 but is extremely slow — 16 minutes per step (984s/it). At 30 steps that's ~8 hours. Memory usage is only 134 GiB of 192 GiB available.\n```\nTrain:   3%|▎         | 1/30 [16:24<7:55:50, 984.51s/it]\n{'loss': 0.28449661, 'grad_norm': 0.05588317, 'learning_rate': 2e-05, 'memory(GiB)': 134.01, 'train_speed(s/it)': 984.51}\n```\n\nConfig:\n```python\ntarget_modules='all-linear',\nlora_rank=32, lora_alpha=32,\ngradient_accumulation_steps=8,\nmax_length=4096,\n```"
+      },
+      {
+        "role": "assistant",
+        "content": "The slowness is caused by `target_modules='all-linear'` applying LoRA to every linear layer in the MoE model. With 512 experts, each having 3 FFN projections (gate_proj, up_proj, down_proj), that's 1,536 LoRA adapters just for the expert FFNs — on top of the attention layers.\n\nAdditionally:\n- `lora_rank=32` is 4x larger than typical MoE fine-tuning (rank 8)\n- `gradient_accumulation_steps=8` means 8 forward/backward passes per optimizer step\n\n**Fix:** Use targeted modules instead of `all-linear`, reduce rank, and remove accumulation:\n```python\ntarget_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_up_proj', 'down_proj'],\nlora_rank=8, lora_alpha=16,\ngradient_accumulation_steps=1,\n```\n\n**Why these specific targets for MoE?**\n- `q_proj`, `k_proj`, `v_proj`, `o_proj` — attention layers, shared across all tokens\n- `gate_up_proj`, `down_proj` — MoE stacked expert projections (one tensor per layer, NOT per expert). These allow expert adaptation with minimal overhead.\n- Do NOT use `all-linear` — it matches every linear sublayer including per-expert modules, creating 1,536+ LoRA adapters.\n\n**Lesson:** For MoE models, never use `target_modules='all-linear'`. Instead, explicitly target attention projections plus the stacked MoE projections (`gate_up_proj`, `down_proj`). The stacked projections are single tensors per layer (not per expert), so they add minimal overhead while still allowing expert adaptation."
+      },
+      {
+        "role": "user",
+        "content": "After applying the fix, the new run is dramatically faster:\n```\nStep 1: 179s (2:59) — includes compilation warmup\nStep 2: 82s (1:22) — steady state throughput\nMemory: 113.25 GiB (down from 134.01 GiB)\nETA: ~41 minutes (down from ~8 hours)\n```\nThat's a ~10x speedup at steady state. Loss and metrics look healthy (0.28 loss, 92% token accuracy)."
+      },
+      {
+        "role": "assistant",
+        "content": "The fix worked as expected. Summary of changes and impact:\n\n| Setting | Before | After |\n|---|---|---|\n| target_modules | `'all-linear'` (1536+ adapters) | `['q_proj','k_proj','v_proj','o_proj','gate_up_proj','down_proj']` (6 per layer) |\n| lora_rank | 32 | 8 |\n| lora_alpha | 32 | 16 |\n| gradient_accumulation_steps | 8 | 1 |\n| Step time (steady state) | 866s | 82s |\n| Memory | 134.01 GiB | 113.25 GiB |\n| ETA (30 steps) | ~8 hours | ~41 minutes |\n\nThe 10x speedup came primarily from reducing the number of LoRA adapters. `all-linear` on an MoE model with 512 experts creates an adapter for every expert's FFN sublayer. The targeted approach applies LoRA only to the shared attention layers and the stacked MoE tensors, which are single parameters per layer regardless of expert count."
+      }
+    ]
+  },
+  {
+    "bug_id": "ms-swift-16",
+    "title": "Further speed optimization — seq_length, batch_size, gradient checkpointing",
+    "timestamp": "2026-02-17 23:00 PST",
+    "commit": "5446f47",
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an ML infrastructure engineer. Project: fine-tuning Qwen3-Coder-Next-Base (80B MoE, 3B active, 512 experts) on Modal using ms-swift with QLoRA (BNB 4-bit NF4) on B200 (192GB). Training runs at ~82s/step with 113.25 GiB memory (65 GiB headroom)."
+      },
+      {
+        "role": "user",
+        "content": "Training is at ~82s/step steady state. We have 65 GiB of headroom on B200 (113 GiB used of 178 GiB). Can we speed this up further?\n\nCurrent config:\n```python\nmax_seq_length=4096,\nbatch_size=1,\ngradient_checkpointing=True,\n```"
+      },
+      {
+        "role": "assistant",
+        "content": "Three changes to try:\n1. **Reduce `max_seq_length` from 4096 to 2048** — halves compute per step, Datta0's working Unsloth run also used 2048\n2. **Increase `batch_size` from 1 to 2** — better GPU parallelism with the available headroom\n3. **Disable `gradient_checkpointing`** — avoids recomputing activations during backward pass, trading memory for speed\n\n```python\nmax_seq_length=2048,\nbatch_size=2,\ngradient_checkpointing=False,\n```\n\nEstimated speedup: ~20-30s/step (from 82s/step)."
+      },
+      {
+        "role": "user",
+        "content": "Applied the changes. The new run is faster but not as much as estimated — 40-60s/step instead of 20-30s/step:\n```\nStep 2: 66s (down from 82s)\nStep 5: 42s\nStep 6: 40s\nMemory: 113.25 GiB (unchanged)\nETA: ~24 minutes (down from ~41 minutes)\n```\nWhy wasn't the speedup as large as predicted?"
+      },
+      {
+        "role": "assistant",
+        "content": "The estimate was too optimistic for three reasons:\n\n1. **Same total tokens per step.** `batch_size=2 × seq_len=2048 = 4096` tokens, identical to `batch_size=1 × seq_len=4096`. Larger batches don't reduce compute — they only improve GPU parallelism slightly.\n\n2. **Memory unchanged (113.25 GiB).** Gradient checkpointing either didn't take effect (ms-swift may override it) or activation memory is negligible compared to the 41 GiB of quantized model weights + optimizer states.\n\n3. **MoE routing overhead is the bottleneck.** Expert dispatch/gather cost is constant regardless of sequence length. With 512 experts and 10 active per token, the routing computation dominates over attention.\n\n**Lesson:** For MoE models, the compute bottleneck is expert routing, not attention. Reducing sequence length helps less than with dense models. To get significant speedups, you need MoE-specific optimizations like Unsloth's `grouped_mm` backend, or multi-GPU parallelism to distribute experts across devices."
+      }
+    ]
+  },
+  {
+    "bug_id": "ms-swift-17",
+    "title": "Low GPU utilization (27%) due to CPU bottleneck — 1 core starving GPU",
+    "timestamp": "2026-02-18 16:15 PST",
+    "commit": "7268f54",
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an ML infrastructure engineer. Project: fine-tuning Qwen3-Coder-Next-Base (80B MoE, 3B active, 512 experts) on Modal using ms-swift with QLoRA (BNB 4-bit NF4) on B200 (192GB). Launching full dataset training (715 samples from lilyzhng/uigen-ui-code-gen-full) with max_seq_length=8192 and gradient_checkpointing=True."
+      },
+      {
+        "role": "user",
+        "content": "First full dataset training run launched but GPU utilization is only 27%, and training is very slow at 76s/step with an ETA of ~7 hours for 357 steps. The Modal dashboard shows:\n- GPU utilization: 27%\n- GPU memory: 128.86 GiB / 192 GiB (64 GiB headroom)\n- CPU: 1.23 cores used / 1.00 reserved\n\n```\nTrain:   8%|▊         | 29/357 [41:25<6:56:09, 76.13s/it]\n{'loss': 0.2212044, 'grad_norm': 0.0801251, 'learning_rate': 0.00019852, 'aux_loss': 10.73581791, 'token_acc': 0.93556154, 'memory(GiB)': 141.68, 'train_speed(s/it)': 85.708735}\n```\n\nConfig:\n```python\nmax_seq_length=8192,\nbatch_size=2,\ngradient_checkpointing=True,\ndataloader_num_workers=4,\n# Modal function has no cpu= parameter (defaults to 1 core)\n```"
+      },
+      {
+        "role": "assistant",
+        "content": "The bottleneck is **CPU, not GPU**. Modal defaults to 1 CPU core when no `cpu=` parameter is specified. With `dataloader_num_workers=4`, four data loading workers compete for a single core, creating a data pipeline bottleneck that starves the GPU.\n\nFour fixes:\n\n**1. Request more CPU cores from Modal (biggest impact):**\n```python\n@app.function(\n    image=train_image,\n    gpu='B200',\n    cpu=8,  # Was missing — Modal defaults to 1 core\n    ...\n)\n```\n\n**2. Enable dataset packing:**\n```python\npacking=True,  # Pack multiple short samples into one 8192-token sequence\n```\nSamples range from 4k-40k chars (~1k-10k tokens). Without packing, shorter samples waste padding. With packing, multiple samples fill each 8192-token window, reducing total steps and padding overhead.\n\n**3. Increase batch size to use VRAM headroom:**\n```python\nbatch_size=4,  # Was 2 — 64 GiB VRAM headroom unused\n```\n\n**4. Match dataloader workers to CPU cores:**\n```python\ndataloader_num_workers=8,  # Match cpu=8\n```\n\n**Lesson:** Always check CPU allocation on cloud GPU platforms. A single CPU core is the most common hidden bottleneck — data loading, tokenization, and preprocessing all compete for CPU time. Low GPU utilization (below 50%) almost always indicates a CPU or I/O bottleneck, not a GPU limitation. On Modal, set `cpu=` explicitly in the function decorator."
+      }
+    ]
+  }
+]
