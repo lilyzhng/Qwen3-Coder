@@ -16,6 +16,13 @@ Usage:
 
     # Limit dataset size
     modal run Qwen3-Coder/ms-swift/modal_coder_base.py --dataset-name lilyzhng/uigen-ui-code-gen --max-steps 100 --train-size 1000
+
+    # Full training (1 epoch) on B200
+      modal run --detach Qwen3-Coder/ms-swift/modal_coder_base.py \
+      --dataset-name lilyzhng/uigen-ui-code-gen-full \
+      --max-steps -1 \
+      --num-epochs 1 \
+      --gpu-type B200
 """
 
 from dataclasses import dataclass
@@ -75,7 +82,7 @@ TIMEOUT_HOURS = 6
 class TrainingConfig:
     # Model — 80B MoE, 3B active params, 512 experts (10 active + 1 shared)
     model_name: str = 'Qwen/Qwen3-Coder-Next-Base'
-    max_seq_length: int = 2048
+    max_seq_length: int = 8192
 
     # LoRA
     lora_rank: int = 8
@@ -85,7 +92,7 @@ class TrainingConfig:
     learning_rate: float = 2e-4
     num_epochs: int = 1
     max_steps: int = 30  # Set to -1 to use num_epochs
-    batch_size: int = 2
+    batch_size: int = 4
     gradient_accumulation_steps: int = 1
     warmup_steps: int = 10
     weight_decay: float = 0.01
@@ -131,6 +138,7 @@ class TrainingConfig:
 @app.function(
     image=train_image,
     gpu='H100',
+    cpu=8,
     volumes={
         '/checkpoints': checkpoint_vol,
     },
@@ -144,6 +152,7 @@ def finetune_h100(config: TrainingConfig):
 @app.function(
     image=train_image,
     gpu='H200',
+    cpu=8,
     volumes={
         '/checkpoints': checkpoint_vol,
     },
@@ -157,6 +166,7 @@ def finetune_h200(config: TrainingConfig):
 @app.function(
     image=train_image,
     gpu='B200',
+    cpu=8,
     volumes={
         '/checkpoints': checkpoint_vol,
     },
@@ -276,12 +286,15 @@ def _finetune_impl(config: TrainingConfig):
         report_to=['wandb'],
         run_name=config.experiment_name,
 
-        # Memory optimization — disabled: 65 GiB headroom on B200, no need to trade compute for memory
-        gradient_checkpointing=False,
+        # Memory optimization — enabled for 8192 seq length (longer sequences need more activation memory)
+        gradient_checkpointing=True,
+
+        # Dataset packing — pack multiple samples into one 8192-token sequence to reduce padding waste
+        packing=True,
 
         # Misc
         seed=config.seed,
-        dataloader_num_workers=4,
+        dataloader_num_workers=8,  # Match cpu=8 in Modal function
     ))
 
     # Commit checkpoints to Modal volume
