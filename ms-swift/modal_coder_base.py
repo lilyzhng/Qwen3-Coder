@@ -82,7 +82,7 @@ TIMEOUT_HOURS = 6
 class TrainingConfig:
     # Model — 80B MoE, 3B active params, 512 experts (10 active + 1 shared)
     model_name: str = 'Qwen/Qwen3-Coder-Next-Base'
-    max_seq_length: int = 8192
+    max_seq_length: int = 2048
 
     # LoRA
     lora_rank: int = 8
@@ -92,7 +92,7 @@ class TrainingConfig:
     learning_rate: float = 2e-4
     num_epochs: int = 1
     max_steps: int = 30  # Set to -1 to use num_epochs
-    batch_size: int = 4
+    batch_size: int = 2
     gradient_accumulation_steps: int = 1
     warmup_steps: int = 10
     weight_decay: float = 0.01
@@ -111,6 +111,7 @@ class TrainingConfig:
 
     # Hardware
     gpu_type: str = 'B200'  # B200 (192GB) — needed for MoE expert conversion during loading (~140GB bf16 temporary)
+    num_gpus: int = 1  # Number of GPUs (2+ enables DDP via torchrun)
 
     # HuggingFace Upload
     push_to_hub: bool = True
@@ -177,10 +178,25 @@ def finetune_b200(config: TrainingConfig):
     return _finetune_impl(config)
 
 
+@app.function(
+    image=train_image,
+    gpu='B200:2',
+    cpu=16,
+    volumes={
+        '/checkpoints': checkpoint_vol,
+    },
+    secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
+    timeout=TIMEOUT_HOURS * 60 * 60,
+)
+def finetune_b200_2gpu(config: TrainingConfig):
+    return _finetune_impl(config)
+
+
 _gpu_functions = {
     'H100': finetune_h100,
     'H200': finetune_h200,
     'B200': finetune_b200,
+    'B200:2': finetune_b200_2gpu,
 }
 
 
@@ -233,69 +249,111 @@ def _finetune_impl(config: TrainingConfig):
     print('=' * 80 + '\n')
 
     # -----------------------------------------------------------------------
-    # Run training via ms-swift Python API
+    # Run training via ms-swift
     # -----------------------------------------------------------------------
     # swift pt = pre-training mode (base model, no chat template, full text loss)
-    # This matches the UnSloth SFTTrainer behavior on base models
-    from swift import PretrainArguments, pretrain_main
+    target_modules_str = 'q_proj k_proj v_proj o_proj gate_up_proj down_proj'
 
-    pretrain_main(PretrainArguments(
-        model=config.model_name,
-        dataset=[dataset_str],
-        use_hf=True,  # Use HuggingFace (not ModelScope) — match baked-in cache
+    if config.num_gpus > 1:
+        # Multi-GPU: use CLI with NPROC_PER_NODE (triggers torchrun internally)
+        import subprocess
+        os.environ['NPROC_PER_NODE'] = str(config.num_gpus)
 
-        # LoRA configuration
-        tuner_type='lora',
-        lora_rank=config.lora_rank,
-        lora_alpha=config.lora_alpha,
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_up_proj', 'down_proj'],  # Attention + MoE stacked expert projections
+        cmd = [
+            'swift', 'pt',
+            '--model', config.model_name,
+            '--dataset', dataset_str,
+            '--use_hf', 'true',
+            '--tuner_type', 'lora',
+            '--lora_rank', str(config.lora_rank),
+            '--lora_alpha', str(config.lora_alpha),
+            '--target_modules', *target_modules_str.split(),
+            '--quant_method', 'bnb',
+            '--quant_bits', '4',
+            '--bnb_4bit_compute_dtype', 'bfloat16',
+            '--bnb_4bit_quant_type', 'nf4',
+            '--bnb_4bit_use_double_quant', 'true',
+            '--torch_dtype', 'bfloat16',
+            '--max_length', str(config.max_seq_length),
+            '--per_device_train_batch_size', str(config.batch_size),
+            '--gradient_accumulation_steps', str(config.gradient_accumulation_steps),
+            '--learning_rate', str(config.learning_rate),
+            '--num_train_epochs', str(num_epochs),
+            '--max_steps', str(max_steps),
+            '--warmup_steps', str(config.warmup_steps),
+            '--weight_decay', str(config.weight_decay),
+            '--lr_scheduler_type', config.lr_scheduler_type,
+            '--optim', 'adamw_8bit',
+            '--router_aux_loss_coef', str(config.router_aux_loss_coef),
+            '--logging_steps', str(config.logging_steps),
+            '--save_steps', str(config.save_steps),
+            '--save_total_limit', '2',
+            '--output_dir', output_dir,
+            '--report_to', 'wandb',
+            '--run_name', config.experiment_name,
+            '--gradient_checkpointing', 'false',
+            '--seed', str(config.seed),
+            '--dataloader_num_workers', '8',
+        ]
 
-        # QLoRA — 4-bit BNB quantization
-        quant_method='bnb',
-        quant_bits=4,
-        bnb_4bit_compute_dtype='bfloat16',
-        bnb_4bit_quant_type='nf4',
-        bnb_4bit_use_double_quant=True,
-        torch_dtype='bfloat16',
-        # device_map removed: Bug 11 OOM was caused by ModelScope (bf16 load), not device_map.
-        # With USE_HF=1, model loads in 4-bit (~41GB) which fits H200 (141GB) without offloading.
-        # BNB 4-bit rejects device_map='auto' if any modules land on CPU (Bug 12).
+        print(f'Running with {config.num_gpus} GPUs via torchrun...')
+        print(f'Command: {" ".join(cmd)}\n')
+        result = subprocess.run(cmd, check=True)
+    else:
+        # Single GPU: use Python API directly
+        from swift import PretrainArguments, pretrain_main
 
-        # Sequence length
-        max_length=config.max_seq_length,
+        pretrain_main(PretrainArguments(
+            model=config.model_name,
+            dataset=[dataset_str],
+            use_hf=True,
 
-        # Training hyperparameters (matched from UnSloth script)
-        per_device_train_batch_size=config.batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        learning_rate=config.learning_rate,
-        num_train_epochs=num_epochs,
-        max_steps=max_steps,
-        warmup_steps=config.warmup_steps,
-        weight_decay=config.weight_decay,
-        lr_scheduler_type=config.lr_scheduler_type,
-        optim='adamw_8bit',
+            # LoRA configuration
+            tuner_type='lora',
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_up_proj', 'down_proj'],
 
-        # MoE-specific: router load balancing loss
-        router_aux_loss_coef=config.router_aux_loss_coef,
+            # QLoRA — 4-bit BNB quantization
+            quant_method='bnb',
+            quant_bits=4,
+            bnb_4bit_compute_dtype='bfloat16',
+            bnb_4bit_quant_type='nf4',
+            bnb_4bit_use_double_quant=True,
+            torch_dtype='bfloat16',
 
-        # Logging & saving
-        logging_steps=config.logging_steps,
-        save_steps=config.save_steps,
-        save_total_limit=2,
-        output_dir=output_dir,
-        report_to=['wandb'],
-        run_name=config.experiment_name,
+            # Sequence length
+            max_length=config.max_seq_length,
 
-        # Memory optimization — enabled for 8192 seq length (longer sequences need more activation memory)
-        gradient_checkpointing=True,
+            # Training hyperparameters
+            per_device_train_batch_size=config.batch_size,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            learning_rate=config.learning_rate,
+            num_train_epochs=num_epochs,
+            max_steps=max_steps,
+            warmup_steps=config.warmup_steps,
+            weight_decay=config.weight_decay,
+            lr_scheduler_type=config.lr_scheduler_type,
+            optim='adamw_8bit',
 
-        # Dataset packing — pack multiple samples into one 8192-token sequence to reduce padding waste
-        packing=True,
+            # MoE-specific
+            router_aux_loss_coef=config.router_aux_loss_coef,
 
-        # Misc
-        seed=config.seed,
-        dataloader_num_workers=8,  # Match cpu=8 in Modal function
-    ))
+            # Logging & saving
+            logging_steps=config.logging_steps,
+            save_steps=config.save_steps,
+            save_total_limit=2,
+            output_dir=output_dir,
+            report_to=['wandb'],
+            run_name=config.experiment_name,
+
+            # Memory optimization
+            gradient_checkpointing=False,
+
+            # Misc
+            seed=config.seed,
+            dataloader_num_workers=8,
+        ))
 
     # Commit checkpoints to Modal volume
     checkpoint_vol.commit()
@@ -361,6 +419,7 @@ def main(
     hf_username: str = None,
     hf_private: bool = None,
     router_aux_loss_coef: float = None,
+    num_gpus: int = None,
 ):
     """
     Launch Qwen3-Coder-Next-Base QLoRA fine-tuning on Modal with ms-swift.
@@ -369,9 +428,9 @@ def main(
         # Quick test (30 steps)
         modal run --detach Qwen3-Coder/ms-swift/modal_coder_base.py --dataset-name lilyzhng/uigen-ui-code-gen
 
-        # Full epoch on H200
+        # Full epoch on 2 GPUs
         modal run --detach Qwen3-Coder/ms-swift/modal_coder_base.py \\
-            --dataset-name lilyzhng/uigen-ui-code-gen --num-epochs 1 --max-steps -1 --gpu-type H200
+            --dataset-name lilyzhng/uigen-ui-code-gen-full --num-epochs 1 --max-steps -1 --num-gpus 2
 
         # Smaller test with 500 samples
         modal run --detach Qwen3-Coder/ms-swift/modal_coder_base.py \\
@@ -397,6 +456,7 @@ def main(
         'hf_username': hf_username,
         'hf_private': hf_private,
         'router_aux_loss_coef': router_aux_loss_coef,
+        'num_gpus': num_gpus,
     }.items():
         if val is not None:
             config_dict[key] = val
@@ -407,7 +467,7 @@ def main(
     print('Qwen3-Coder-Next-Base Fine-tuning (ms-swift + QLoRA)')
     print('=' * 80)
     print(f'Model: {config.model_name}')
-    print(f'GPU: {config.gpu_type}')
+    print(f'GPU: {config.gpu_type} x {config.num_gpus}')
     print(f'Dataset: {config.dataset_name}')
     if config.train_size:
         print(f'  Training samples: {config.train_size}')
@@ -426,11 +486,16 @@ def main(
         print(f'  Repository: {config.hf_username}/{config.hf_repo_name}')
     print('=' * 80 + '\n')
 
-    if config.gpu_type not in _gpu_functions:
-        raise ValueError(f'Unknown GPU type: {config.gpu_type}. Must be H100, H200, or B200')
+    # Resolve GPU function — append ':N' for multi-GPU
+    gpu_key = config.gpu_type
+    if config.num_gpus > 1:
+        gpu_key = f'{config.gpu_type}:{config.num_gpus}'
 
-    print(f'Launching on Modal with {config.gpu_type}...\n')
-    experiment = _gpu_functions[config.gpu_type].remote(config)
+    if gpu_key not in _gpu_functions:
+        raise ValueError(f'Unknown GPU config: {gpu_key}. Available: {list(_gpu_functions.keys())}')
+
+    print(f'Launching on Modal with {gpu_key} ({config.num_gpus} GPU(s))...\n')
+    experiment = _gpu_functions[gpu_key].remote(config)
 
     print(f'\nDone! Experiment: {experiment}')
     print(f'To download: modal volume get qwen-swift-checkpoints /{experiment}/ ./output/')

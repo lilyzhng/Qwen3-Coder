@@ -71,6 +71,7 @@ train_image = (
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
         'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True',
         'UNSLOTH_MOE_BACKEND': 'grouped_mm',  # Best for B200
+        'UNSLOTH_ENABLE_LOGGING': '1',  # Debug logging for hang diagnosis
     })
 )
 
