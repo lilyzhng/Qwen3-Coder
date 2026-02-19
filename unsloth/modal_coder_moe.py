@@ -58,6 +58,14 @@ train_image = (
         'pip install "transformers @ git+https://github.com/huggingface/transformers.git"'
         ' "trl @ git+https://github.com/huggingface/trl.git"'
     )
+    # Apply Datta0's unsloth-zoo patch for transformers v5 + MoE compatibility:
+    # - Fixes nn.Parameter + peft detection (training hang fix)
+    # - Adds native Qwen3-Next MoE support (qwen3_next_moe.py)
+    # - Adds BNB 4-bit dequantization for MoE grouped_mm
+    .run_commands(
+        'pip uninstall -y unsloth-zoo'
+        ' && pip install "unsloth-zoo @ git+https://github.com/datta0/unsloth-zoo@transformers_v5_patches"'
+    )
     .env({
         'HF_HOME': '/root/model_cache',
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
@@ -203,6 +211,7 @@ def load_and_format_data(tokenizer, config: TrainingConfig):
 @app.function(
     image=train_image,
     gpu='H100',
+    cpu=8,
     volumes={
         '/model_cache': model_cache_vol,
         '/checkpoints': checkpoint_vol,
@@ -219,6 +228,7 @@ def finetune_h100(config: TrainingConfig):
 @app.function(
     image=train_image,
     gpu='H200',
+    cpu=8,
     volumes={
         '/model_cache': model_cache_vol,
         '/checkpoints': checkpoint_vol,
@@ -235,6 +245,7 @@ def finetune_h200(config: TrainingConfig):
 @app.function(
     image=train_image,
     gpu='B200',
+    cpu=8,
     volumes={
         '/model_cache': model_cache_vol,
         '/checkpoints': checkpoint_vol,
@@ -295,6 +306,7 @@ def _finetune_impl(config: TrainingConfig):
         max_seq_length=config.max_seq_length,
         dtype=getattr(torch, config.dtype) if hasattr(torch, config.dtype) else None,
         load_in_4bit=config.load_in_4bit,  # Must be False for MoE
+        fast_inference=False,  # Not supported for MoE yet
     )
 
     print_gpu_memory('After model load')
