@@ -1,32 +1,23 @@
 """
-Fine-tune Qwen3-Coder-Next-Base (80B MoE, 3B active) on Modal using ms-swift (swift pt).
+Fine-tune Qwen3-Coder-Next (80B MoE, instruct) on Modal using ms-swift SFT (instruction tuning).
 
-This script runs pre-training style (swift pt): full-sequence next-token loss, no chat
-template. For instruction/chat datasets (question→answer or messages), use
-modal_coder_instruct.py instead (swift sft).
+Use this script for chat/instruction datasets (question→answer or messages). It runs
+swift sft: the chat template is applied and loss is on the response (default).
+For raw continuous text pre-training, use modal_coder_base.py (swift pt) instead.
 
-ms-swift handles MoE models better than UnSloth for large models:
-- Proper BitsAndBytes 4-bit quantization for 80B parameter MoE models
-- MoE-specific router auxiliary loss for expert load balancing
-- Gradient checkpointing enabled by default
-- Compatible with DeepSpeed ZeRO-2/ZeRO-3 for multi-GPU scaling
+ms-swift handles MoE models well: QLoRA, router aux loss, multi-GPU.
 
 Usage:
-    # Quick test (30 steps) on H100
-    modal run Qwen3-Coder/ms-swift/modal_coder_base.py --dataset-name lilyzhng/uigen-ui-code-gen --max-steps 30
+    # UIGEN-T1.1-TAILWIND (question/answer) — 1 epoch, 2× B200
+    modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
+      --dataset-name smirki/UIGEN-T1.1-TAILWIND \\
+      --max-steps -1 --num-epochs 1 --gpu-type B200 --num-gpus 2
 
-    # Full training (1 epoch) on H200 for extra headroom
-    modal run Qwen3-Coder/ms-swift/modal_coder_base.py --dataset-name lilyzhng/uigen-ui-code-gen --num-epochs 1 --gpu-type H200
+    # Quick test (30 steps)
+    modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py --dataset-name smirki/UIGEN-T1.1-TAILWIND --max-steps 30
 
     # Limit dataset size
-    modal run Qwen3-Coder/ms-swift/modal_coder_base.py --dataset-name lilyzhng/uigen-ui-code-gen --max-steps 100 --train-size 1000
-
-    # Full training (1 epoch) on B200
-      modal run --detach Qwen3-Coder/ms-swift/modal_coder_base.py \
-      --dataset-name lilyzhng/uigen-ui-code-gen-full \
-      --max-steps -1 \
-      --num-epochs 1 \
-      --gpu-type B200
+    modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py --dataset-name smirki/UIGEN-T1.1-TAILWIND --train-size 1000
 """
 
 from dataclasses import dataclass
@@ -38,17 +29,16 @@ import modal
 # ---------------------------------------------------------------------------
 # Modal App & Infrastructure
 # ---------------------------------------------------------------------------
-app = modal.App('qwen3-coder-swift')
+app = modal.App('qwen3-coder-swift-instruct')
 
-# Container image with ms-swift
-# Install from git to get Qwen3-Next support (requires ms-swift >=4.0 dev)
+# Same image as modal_coder_base (ms-swift, Qwen3-Next support)
 train_image = (
     modal.Image.from_registry('nvidia/cuda:12.8.0-devel-ubuntu22.04', add_python='3.11')
-    .apt_install('git', 'build-essential')  # build-essential includes g++ and make
+    .apt_install('git', 'build-essential')
     .pip_install(
         'ms-swift @ git+https://github.com/modelscope/ms-swift.git',
-        'transformers>=4.57,<4.58',  # ms-swift requires <4.58 (see requirements/install_all.sh)
-        'trl<0.25',  # ms-swift requires <0.25
+        'transformers>=4.57,<4.58',
+        'trl<0.25',
         'bitsandbytes',
         'datasets',
         'wandb',
@@ -56,26 +46,19 @@ train_image = (
         'huggingface_hub',
         'flash-linear-attention',
     )
-    # causal-conv1d has no pre-built wheel for torch 2.10+, so it must compile
-    # from source. --no-build-isolation lets it find the already-installed torch.
-    # Set CC and CXX to force use of gcc/g++ instead of clang (which isn't installed)
     .run_commands('CC=gcc CXX=g++ pip install causal-conv1d --no-build-isolation')
     .env({
-        'HF_HOME': '/root/model_cache',  # NOT /model_cache — avoid volume mount shadowing
+        'HF_HOME': '/root/model_cache',
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
         'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True',
-        'USE_HF': '1',  # Force ms-swift to use HuggingFace (not ModelScope)
+        'USE_HF': '1',
     })
     .run_commands(
-        "python -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Coder-Next-Base', max_workers=10)\"",
+        "python -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Coder-Next', max_workers=10)\"",
     )
 )
 
-# ---------------------------------------------------------------------------
-# Persistent volumes
-# ---------------------------------------------------------------------------
 checkpoint_vol = modal.Volume.from_name('qwen-swift-checkpoints', create_if_missing=True)
-
 TIMEOUT_HOURS = 6
 
 
@@ -84,8 +67,8 @@ TIMEOUT_HOURS = 6
 # ---------------------------------------------------------------------------
 @dataclass
 class TrainingConfig:
-    # Model — 80B MoE, 3B active params, 512 experts (10 active + 1 shared)
-    model_name: str = 'Qwen/Qwen3-Coder-Next-Base'
+    # Model — 80B MoE, 3B active
+    model_name: str = 'Qwen/Qwen3-Coder-Next'
     max_seq_length: int = 2048
 
     # LoRA
@@ -103,19 +86,19 @@ class TrainingConfig:
     lr_scheduler_type: str = 'cosine'
 
     # MoE-specific
-    router_aux_loss_coef: float = 1e-3  # Router load balancing loss
+    router_aux_loss_coef: float = 1e-3
 
-    # Dataset — HuggingFace dataset with 'text' column
+    # Dataset — HuggingFace dataset with question/answer or messages (e.g. smirki/UIGEN-T1.1-TAILWIND)
     dataset_name: str = None
-    train_size: int = None  # None = full dataset
+    train_size: int = None
 
     # Logging
     logging_steps: int = 1
     save_steps: int = 50
 
     # Hardware
-    gpu_type: str = 'B200'  # B200 (192GB) — needed for MoE expert conversion during loading (~140GB bf16 temporary)
-    num_gpus: int = 1  # Number of GPUs (2+ enables DDP via torchrun)
+    gpu_type: str = 'B200'
+    num_gpus: int = 1
 
     # HuggingFace Upload
     push_to_hub: bool = True
@@ -132,7 +115,7 @@ class TrainingConfig:
         if self.experiment_name is None:
             timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
             model_short = self.model_name.split('/')[-1]
-            self.experiment_name = f'{model_short}-swift-r{self.lora_rank}-{timestamp}'
+            self.experiment_name = f'{model_short}-sft-r{self.lora_rank}-{timestamp}'
         if self.hf_repo_name is None:
             self.hf_repo_name = self.experiment_name
 
@@ -144,9 +127,7 @@ class TrainingConfig:
     image=train_image,
     gpu='H100',
     cpu=8,
-    volumes={
-        '/checkpoints': checkpoint_vol,
-    },
+    volumes={'/checkpoints': checkpoint_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -158,9 +139,7 @@ def finetune_h100(config: TrainingConfig):
     image=train_image,
     gpu='H200',
     cpu=8,
-    volumes={
-        '/checkpoints': checkpoint_vol,
-    },
+    volumes={'/checkpoints': checkpoint_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -172,9 +151,7 @@ def finetune_h200(config: TrainingConfig):
     image=train_image,
     gpu='B200',
     cpu=8,
-    volumes={
-        '/checkpoints': checkpoint_vol,
-    },
+    volumes={'/checkpoints': checkpoint_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -186,9 +163,7 @@ def finetune_b200(config: TrainingConfig):
     image=train_image,
     gpu='B200:2',
     cpu=16,
-    volumes={
-        '/checkpoints': checkpoint_vol,
-    },
+    volumes={'/checkpoints': checkpoint_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -205,41 +180,38 @@ _gpu_functions = {
 
 
 # ---------------------------------------------------------------------------
-# Training Implementation
+# Training Implementation (swift sft)
 # ---------------------------------------------------------------------------
 def _finetune_impl(config: TrainingConfig):
-    """Run QLoRA fine-tuning with ms-swift on Modal."""
+    """Run QLoRA SFT (instruction tuning) with ms-swift on Modal."""
     import os
 
     import torch
 
-    # Print GPU info
     if torch.cuda.is_available():
         gpu = torch.cuda.get_device_properties(0)
         total_gb = round(gpu.total_memory / 1024**3, 1)
         print(f'GPU: {gpu.name}, {total_gb} GB VRAM')
 
-    # Set wandb project via env var (ms-swift/HF Trainer reads this)
     os.environ['WANDB_PROJECT'] = config.wandb_project
 
-    # Build dataset string — ms-swift syntax: 'dataset_id#count'
     if not config.dataset_name:
-        raise ValueError('Must specify --dataset-name (HuggingFace dataset with "text" column)')
+        raise ValueError(
+            'Must specify --dataset-name (HuggingFace dataset, e.g. question/answer or messages)'
+        )
     dataset_str = config.dataset_name
     if config.train_size:
         dataset_str = f'{config.dataset_name}#{config.train_size}'
 
-    # Handle max_steps vs num_epochs
     max_steps = config.max_steps if config.max_steps > 0 else -1
     num_epochs = config.num_epochs if max_steps == -1 else 1
-
     output_dir = f'/checkpoints/{config.experiment_name}'
 
     print('\n' + '=' * 80)
-    print('ms-swift QLoRA Fine-tuning — Qwen3-Coder-Next-Base (MoE)')
+    print('ms-swift SFT (instruction tuning) QLoRA — Qwen3-Coder-Next (MoE)')
     print('=' * 80)
     print(f'Model: {config.model_name} (80B total, 3B active, 512 experts)')
-    print(f'Quantization: BNB 4-bit NF4 (QLoRA)')
+    print('Quantization: BNB 4-bit NF4 (QLoRA)')
     print(f'LoRA: rank={config.lora_rank}, alpha={config.lora_alpha}')
     print(f'Dataset: {dataset_str}')
     print(f'Training: {num_epochs} epoch(s), max {max_steps} steps')
@@ -252,19 +224,15 @@ def _finetune_impl(config: TrainingConfig):
     print(f'Experiment: {config.experiment_name}')
     print('=' * 80 + '\n')
 
-    # -----------------------------------------------------------------------
-    # Run training via ms-swift
-    # -----------------------------------------------------------------------
-    # swift pt = pre-training mode (base model, no chat template, full text loss)
+    # swift sft = supervised fine-tuning (chat template, loss on response by default)
     target_modules_str = 'q_proj k_proj v_proj o_proj gate_up_proj down_proj'
 
     if config.num_gpus > 1:
-        # Multi-GPU: use CLI with NPROC_PER_NODE (triggers torchrun internally)
         import subprocess
         os.environ['NPROC_PER_NODE'] = str(config.num_gpus)
 
         cmd = [
-            'swift', 'pt',
+            'swift', 'sft',
             '--model', config.model_name,
             '--dataset', dataset_str,
             '--use_hf', 'true',
@@ -301,24 +269,21 @@ def _finetune_impl(config: TrainingConfig):
         ]
 
         print(f'Running with {config.num_gpus} GPUs via torchrun...')
-        print(f'Command: {" ".join(cmd)}\n')
-        result = subprocess.run(cmd, check=True)
+        print('Command: ' + ' '.join(cmd) + '\n')
+        subprocess.run(cmd, check=True)
     else:
-        # Single GPU: use Python API directly
-        from swift import PretrainArguments, pretrain_main
+        from swift import SftArguments, sft_main
 
-        pretrain_main(PretrainArguments(
+        sft_main(SftArguments(
             model=config.model_name,
             dataset=[dataset_str],
             use_hf=True,
 
-            # LoRA configuration
             tuner_type='lora',
             lora_rank=config.lora_rank,
             lora_alpha=config.lora_alpha,
             target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_up_proj', 'down_proj'],
 
-            # QLoRA — 4-bit BNB quantization
             quant_method='bnb',
             quant_bits=4,
             bnb_4bit_compute_dtype='bfloat16',
@@ -326,10 +291,8 @@ def _finetune_impl(config: TrainingConfig):
             bnb_4bit_use_double_quant=True,
             torch_dtype='bfloat16',
 
-            # Sequence length
             max_length=config.max_seq_length,
 
-            # Training hyperparameters
             per_device_train_batch_size=config.batch_size,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
             learning_rate=config.learning_rate,
@@ -340,10 +303,8 @@ def _finetune_impl(config: TrainingConfig):
             lr_scheduler_type=config.lr_scheduler_type,
             optim='adamw_8bit',
 
-            # MoE-specific
             router_aux_loss_coef=config.router_aux_loss_coef,
 
-            # Logging & saving
             logging_steps=config.logging_steps,
             save_steps=config.save_steps,
             save_total_limit=2,
@@ -351,21 +312,15 @@ def _finetune_impl(config: TrainingConfig):
             report_to=['wandb'],
             run_name=config.experiment_name,
 
-            # Memory optimization
             gradient_checkpointing=False,
 
-            # Misc
             seed=config.seed,
             dataloader_num_workers=8,
         ))
 
-    # Commit checkpoints to Modal volume
     checkpoint_vol.commit()
     print(f'\nCheckpoints saved to Modal volume: {output_dir}')
 
-    # -----------------------------------------------------------------------
-    # Push LoRA adapter to HuggingFace Hub
-    # -----------------------------------------------------------------------
     if config.push_to_hub:
         hf_token = os.environ.get('HF_TOKEN')
         repo_id = f'{config.hf_username}/{config.hf_repo_name}'
@@ -426,19 +381,17 @@ def main(
     num_gpus: int = None,
 ):
     """
-    Launch Qwen3-Coder-Next-Base QLoRA fine-tuning on Modal with ms-swift.
+    Launch Qwen3-Coder-Next SFT (instruction tuning) on Modal with ms-swift.
+
+    Use for chat datasets (question/answer or messages). For raw text pre-training use modal_coder_base.py.
 
     Examples:
-        # Quick test (30 steps)
-        modal run --detach Qwen3-Coder/ms-swift/modal_coder_base.py --dataset-name lilyzhng/uigen-ui-code-gen
+        # UIGEN-T1.1-TAILWIND, 1 epoch, 2× B200
+        modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
+            --dataset-name smirki/UIGEN-T1.1-TAILWIND --num-epochs 1 --max-steps -1 --gpu-type B200 --num-gpus 2
 
-        # Full epoch on 2 GPUs
-        modal run --detach Qwen3-Coder/ms-swift/modal_coder_base.py \\
-            --dataset-name lilyzhng/uigen-ui-code-gen-full --num-epochs 1 --max-steps -1 --num-gpus 2
-
-        # Smaller test with 500 samples
-        modal run --detach Qwen3-Coder/ms-swift/modal_coder_base.py \\
-            --dataset-name lilyzhng/uigen-ui-code-gen --train-size 500
+        # Quick test
+        modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py --dataset-name smirki/UIGEN-T1.1-TAILWIND --max-steps 30
     """
     config_dict = {}
     for key, val in {
@@ -468,7 +421,7 @@ def main(
     config = TrainingConfig(**config_dict)
 
     print('=' * 80)
-    print('Qwen3-Coder-Next-Base Fine-tuning (ms-swift + QLoRA)')
+    print('Qwen3-Coder-Next SFT (ms-swift + QLoRA)')
     print('=' * 80)
     print(f'Model: {config.model_name}')
     print(f'GPU: {config.gpu_type} x {config.num_gpus}')
@@ -476,7 +429,7 @@ def main(
     if config.train_size:
         print(f'  Training samples: {config.train_size}')
     else:
-        print(f'  Training samples: full dataset')
+        print('  Training samples: full dataset')
     print(f'LoRA: rank={config.lora_rank}, alpha={config.lora_alpha}')
     print(f'Batch: {config.batch_size} x {config.gradient_accumulation_steps} '
           f'= {config.batch_size * config.gradient_accumulation_steps}')
@@ -490,7 +443,6 @@ def main(
         print(f'  Repository: {config.hf_username}/{config.hf_repo_name}')
     print('=' * 80 + '\n')
 
-    # Resolve GPU function — append ':N' for multi-GPU
     gpu_key = config.gpu_type
     if config.num_gpus > 1:
         gpu_key = f'{config.gpu_type}:{config.num_gpus}'
