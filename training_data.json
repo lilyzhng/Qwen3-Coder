@@ -358,5 +358,26 @@
         "content": "**Root cause:** `wandb.init()` was called in the \"Process Results\" section, which runs *after* both generation passes (instruct/base model + LoRA) complete. For an 80B MoE model, each generation pass takes 30-60+ minutes, so the W&B run URL only appears ~60+ min into the job. Worse, if the job crashes during generation, W&B was never initialized, so all results are lost.\n\nThe generation timing (`base_generation_time_s`, `lora_generation_time_s`) was also passed via `wandb_config` at init time, which required both generations to finish before `wandb.init()` could be called — a circular dependency.\n\n**Fix applied to both `modal_eval_moe.py` and `modal_eval_instruct.py`:**\n\n1. Moved `wandb.init()` to right after `SamplingParams` setup (before any generation starts). The W&B run URL now prints immediately after model loading.\n\n2. Removed generation timing from the `wandb_config` dict (which is set at init time).\n\n3. Added `wandb.log()` calls immediately after each generation pass:\n   - After instruct/base generation: `wandb.log({\"instruct_generation_time_s\": ..., \"instruct_total_tokens\": ...})`\n   - After LoRA generation: `wandb.log({\"lora_generation_time_s\": ..., \"lora_total_tokens\": ...})`\n\nThe per-sample judging results were already logged incrementally in the loop, so no changes needed there.\n\nNow if the job crashes mid-generation, the W&B run still exists (with config info), and any completed generation timing is already logged."
       }
     ]
+  },
+  {
+    "bug_id": "ms-swift-24",
+    "title": "enforce_eager=True on H200 disables CUDA graphs, causing 3-4x slower vLLM inference",
+    "timestamp": "2026-02-19 23:45 PST",
+    "commit": "e4d9ada",
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Project: Qwen3-Coder-Next (80B MoE, 3B active) evaluation on Modal. Scripts: modal_eval_moe.py and modal_eval_instruct.py. Inference backend: vLLM v0.15.1 with FP8 quantization. GPU: NVIDIA H200 (140 GB VRAM)."
+      },
+      {
+        "role": "user",
+        "content": "Previously when I used unsloth for evaluation with Qwen2.5-Coder (14B dense), it was much faster. Now with this MoE model on vLLM, each sample takes ~12 minutes. The vLLM logs show:\n\nWARNING 02-20 07:23:16 [vllm.py:662] Enforce eager set, overriding optimization level to -O0\nINFO 02-20 07:23:16 [vllm.py:762] Cudagraph is disabled under eager mode\n\nProcessed prompts: 50%|█████ | 1/2 [11:57<11:57, 717.68s/it, est. speed input: 0.05 toks/s, output: 4.64 toks/s]\n\nThe relevant code in modal_eval_instruct.py:\n\n    llm_kwargs = dict(\n        model=model_to_load,\n        dtype=\"bfloat16\",\n        gpu_memory_utilization=0.92,\n        max_model_len=16384,\n        trust_remote_code=True,\n        enforce_eager=True,  # Avoid Triton issues on B200 for non-LoRA path\n    )"
+      },
+      {
+        "role": "assistant",
+        "content": "**Root cause:** `enforce_eager=True` was set in the vLLM `LLM()` kwargs. This flag disables CUDA graphs and forces optimization level to -O0, bypassing all compilation optimizations. It was originally added as a workaround for Triton kernel bugs on **B200/Blackwell** GPUs (the fused MoE LoRA Triton kernel crashes with `tt.elementwise_inline_asm` errors on Blackwell).\n\nHowever, the script runs on **H200** (Hopper architecture), where these Triton kernels work fine. The flag was left over from when `GPU_CONFIG` was set to `B200`.\n\nThe speed difference vs the old Qwen2.5-Coder eval has two factors:\n1. **Model size**: 80B MoE vs ~14B dense — all 80B params must sit in VRAM even though only 3B are active per token\n2. **enforce_eager=True**: Disables CUDA graphs, which alone cause 2-4x slowdown on decode-heavy workloads\n\n**Fix:** Removed `enforce_eager=True` from both `modal_eval_instruct.py` and `modal_eval_moe.py`. The B200 runtime guard (which raises ValueError if LoRA+MoE runs on Blackwell) remains in place as a safety check. Expected speedup: 2-4x faster decoding on H200."
+      }
+    ]
   }
 ]
