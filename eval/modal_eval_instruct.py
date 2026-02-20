@@ -486,7 +486,6 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
         gpu_memory_utilization=0.92,
         max_model_len=16384,
         trust_remote_code=True,
-        enforce_eager=True,  # Avoid Triton issues on B200 for non-LoRA path
     )
     if quantization:
         llm_kwargs["quantization"] = quantization
