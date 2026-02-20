@@ -10,11 +10,18 @@ ms-swift handles MoE models well: QLoRA, router aux loss, multi-GPU.
 Dataset: lilyzhng/UIGEN-T1.1-split (645 train / 80 val / 80 test, split from smirki/UIGEN-T1.1-TAILWIND).
 ms-swift loads the 'train' split by default. The 'test' split is reserved for eval (modal_eval_instruct.py).
 
+Model weights are stored in a persistent Modal volume (qwen-model-cache) so they survive
+image rebuilds. Download once with:
+    modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py::download_model
+
 IMPORTANT: Always use --detach. The 80B MoE model takes several minutes to load, apply
 LoRA, and JIT-compile the first training step. Without --detach, Modal's local heartbeat
 will time out and kill the job before training even starts.
 
 Usage:
+    # One-time model download (only needed when volume is empty)
+    modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py::download_model
+
     # Standard run — 1 epoch on train split, 2× B200
     modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
       --max-steps -1 --num-epochs 1 --gpu-type B200 --num-gpus 2
@@ -38,33 +45,44 @@ import modal
 # ---------------------------------------------------------------------------
 app = modal.App('qwen3-coder-swift-instruct')
 
-# NVIDIA PyTorch container — flash_attn, cuDNN, NCCL pre-installed and tested.
-# No compilation step needed. Tag format: YY.MM-py3.
-# Changelog: https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/
+# Official ms-swift Docker — PyTorch 2.9.0, CUDA 12.8.1, flash_attn 2.8.3, swift 3.12.5 pre-installed.
+# Using this instead of NVIDIA PyTorch container solves the FSDPModule import error (needs PyTorch >=2.7)
+# and avoids compiling flash_attn from source.
+# US-West mirror for lowest latency from Modal (US region).
+# We upgrade swift to git HEAD for Qwen3-Coder-Next support and add a few extra packages.
+#
+# Qwen3-Coder-Next hybrid architecture: 1 in 4 layers = full attention, 3 in 4 = linear attention.
+# flash-linear-attention: pure Python PyPI wheel; causal-conv1d: pre-built cu12 wheel from GitHub.
+_SWIFT_IMAGE = (
+    'modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:'
+    'ubuntu22.04-cuda12.8.1-py311-torch2.9.0-vllm0.13.0-modelscope1.33.0-swift3.12.5'
+)
+_CAUSAL_CONV1D_WHEEL = (
+    'https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.0/'
+    'causal_conv1d-1.6.0+cu12torch2.6cxx11abiTRUE-cp311-cp311-linux_x86_64.whl'
+)
 train_image = (
-    modal.Image.from_registry('nvcr.io/nvidia/pytorch:25.01-py3')
+    modal.Image.from_registry(_SWIFT_IMAGE)
     .pip_install(
         'ms-swift @ git+https://github.com/modelscope/ms-swift.git',
-        'transformers>=4.57,<4.58',
-        'trl<0.25',
-        'bitsandbytes',
-        'datasets',
         'wandb',
         'hf-transfer',
-        'huggingface_hub',
+        'flash-linear-attention',
+        _CAUSAL_CONV1D_WHEEL,
     )
     .env({
-        'HF_HOME': '/root/model_cache',
+        'HF_HOME': '/model_cache',
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
         'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True',
         'USE_HF': '1',
     })
-    .run_commands(
-        "python -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Coder-Next', max_workers=10)\"",
-    )
 )
 
 checkpoint_vol = modal.Volume.from_name('qwen-swift-checkpoints', create_if_missing=True)
+# Model weights volume — download once, reuse across all image rebuilds.
+# Mount path matches HF_HOME so HuggingFace hub finds weights automatically.
+model_vol = modal.Volume.from_name('qwen-model-cache', create_if_missing=True)
+MODEL_MOUNT = '/model_cache'
 TIMEOUT_HOURS = 6
 
 
@@ -109,7 +127,7 @@ class TrainingConfig:
 
     # Hardware
     gpu_type: str = 'B200'
-    num_gpus: int = 1
+    num_gpus: int = 2
 
     # HuggingFace Upload
     push_to_hub: bool = True
@@ -134,13 +152,40 @@ class TrainingConfig:
 
 
 # ---------------------------------------------------------------------------
+# One-time model download — run manually when volume is empty:
+#   modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py::download_model
+# ---------------------------------------------------------------------------
+@app.function(
+    image=train_image,
+    cpu=4,
+    volumes={MODEL_MOUNT: model_vol},
+    secrets=[modal.Secret.from_name('hf-secret')],
+    timeout=2 * 60 * 60,
+)
+def download_model(model_name: str = 'Qwen/Qwen3-Coder-Next'):
+    """Download model weights to the persistent volume. Run once; reused by all training jobs."""
+    import os
+    from huggingface_hub import snapshot_download
+    local_dir = os.path.join(MODEL_MOUNT, 'hub', f'models--{model_name.replace("/", "--")}')
+    if os.path.exists(local_dir):
+        print(f'Model already cached at {local_dir}. Nothing to do.')
+    else:
+        print(f'Downloading {model_name} to {MODEL_MOUNT} ...')
+        snapshot_download(model_name, max_workers=10)
+        model_vol.commit()
+        print('Download complete and committed to volume.')
+
+
+# ---------------------------------------------------------------------------
 # GPU-specific Modal functions
 # ---------------------------------------------------------------------------
+_VOLUMES = {'/checkpoints': checkpoint_vol, MODEL_MOUNT: model_vol}
+
 @app.function(
     image=train_image,
     gpu='H100',
     cpu=8,
-    volumes={'/checkpoints': checkpoint_vol},
+    volumes=_VOLUMES,
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -152,7 +197,7 @@ def finetune_h100(config: TrainingConfig):
     image=train_image,
     gpu='H200',
     cpu=8,
-    volumes={'/checkpoints': checkpoint_vol},
+    volumes=_VOLUMES,
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -164,7 +209,7 @@ def finetune_h200(config: TrainingConfig):
     image=train_image,
     gpu='B200',
     cpu=8,
-    volumes={'/checkpoints': checkpoint_vol},
+    volumes=_VOLUMES,
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -176,7 +221,7 @@ def finetune_b200(config: TrainingConfig):
     image=train_image,
     gpu='B200:2',
     cpu=16,
-    volumes={'/checkpoints': checkpoint_vol},
+    volumes=_VOLUMES,
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -195,7 +240,7 @@ _gpu_functions = {
 # ---------------------------------------------------------------------------
 # Dataset diagnostic
 # ---------------------------------------------------------------------------
-def _diagnose_dataset(dataset_str: str, max_length: int, batch_size: int):
+def _diagnose_dataset(dataset_str: str, max_length: int, batch_size: int, num_gpus: int = 1):
     """Log dataset sample counts at each pipeline stage before training starts.
 
     Prints:
@@ -286,10 +331,13 @@ def _diagnose_dataset(dataset_str: str, max_length: int, batch_size: int):
         n_train = len(train_ds) if train_ds is not None else 0
         print(f'\n  swift load_dataset [train]: {n_train:>6} rows')
 
-        expected_steps = math.ceil(n_train / batch_size)
-        print(f'\n  max_length  : {max_length}')
-        print(f'  batch_size  : {batch_size}')
-        print(f'  expect steps: ~{expected_steps} / epoch')
+        global_batch = batch_size * num_gpus
+        expected_steps = math.ceil(n_train / global_batch)
+        print(f'\n  max_length        : {max_length}')
+        print(f'  batch_size/gpu    : {batch_size}')
+        print(f'  num_gpus          : {num_gpus}')
+        print(f'  global batch size : {global_batch}')
+        print(f'  expect steps      : ~{expected_steps} / epoch')
 
     except Exception as e:
         print(f'  swift load_dataset failed: {e}')
@@ -341,7 +389,7 @@ def _finetune_impl(config: TrainingConfig):
     print(f'Experiment: {config.experiment_name}')
     print('=' * 80 + '\n')
 
-    _diagnose_dataset(dataset_str, config.max_seq_length, config.batch_size)
+    _diagnose_dataset(dataset_str, config.max_seq_length, config.batch_size, config.num_gpus)
 
     if config.num_gpus > 1:
         import subprocess
@@ -380,6 +428,7 @@ def _finetune_impl(config: TrainingConfig):
             '--report_to', 'wandb',
             '--run_name', config.experiment_name,
             '--gradient_checkpointing', str(config.gradient_checkpointing).lower(),
+            '--gradient_checkpointing_kwargs', '{"determinism_check": "none"}',
             '--attn_impl', 'flash_attn',
             '--seed', str(config.seed),
             '--dataloader_num_workers', '8',
@@ -432,6 +481,7 @@ def _finetune_impl(config: TrainingConfig):
             run_name=config.experiment_name,
 
             gradient_checkpointing=config.gradient_checkpointing,
+            gradient_checkpointing_kwargs={'determinism_check': 'none'},
             attn_impl='flash_attn',
 
             seed=config.seed,
