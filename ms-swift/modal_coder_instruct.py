@@ -38,10 +38,11 @@ import modal
 # ---------------------------------------------------------------------------
 app = modal.App('qwen3-coder-swift-instruct')
 
-# Same image as modal_coder_base (ms-swift, Qwen3-Next support)
+# NVIDIA PyTorch container — flash_attn, cuDNN, NCCL pre-installed and tested.
+# No compilation step needed. Tag format: YY.MM-py3.
+# Changelog: https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/
 train_image = (
-    modal.Image.from_registry('nvidia/cuda:12.8.0-devel-ubuntu22.04', add_python='3.11')
-    .apt_install('git', 'build-essential')
+    modal.Image.from_registry('nvcr.io/nvidia/pytorch:25.01-py3')
     .pip_install(
         'ms-swift @ git+https://github.com/modelscope/ms-swift.git',
         'transformers>=4.57,<4.58',
@@ -51,9 +52,7 @@ train_image = (
         'wandb',
         'hf-transfer',
         'huggingface_hub',
-        'flash-linear-attention',
     )
-    .run_commands('CC=gcc CXX=g++ pip install causal-conv1d --no-build-isolation')
     .env({
         'HF_HOME': '/root/model_cache',
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
@@ -89,8 +88,9 @@ class TrainingConfig:
     learning_rate: float = 2e-4
     num_epochs: int = 1
     max_steps: int = -1  # -1 = use num_epochs; set to a positive int for a quick smoke-test
-    batch_size: int = 2
+    batch_size: int = 4  # grad_checkpointing frees ~60 GB so batch_size=4 fits at seq_len=4096
     gradient_accumulation_steps: int = 1
+    gradient_checkpointing: bool = True  # required at seq_len=4096 to fit batch_size=4 on B200
     warmup_steps: int = 10
     weight_decay: float = 0.01
     lr_scheduler_type: str = 'cosine'
@@ -335,6 +335,8 @@ def _finetune_impl(config: TrainingConfig):
     print(f'Learning rate: {config.learning_rate} ({config.lr_scheduler_type})')
     print(f'MoE router aux loss coef: {config.router_aux_loss_coef}')
     print(f'Sequence length: {config.max_seq_length}')
+    print(f'Gradient checkpointing: {config.gradient_checkpointing}')
+    print(f'Attention: flash_attn')
     print(f'Output: {output_dir}')
     print(f'Experiment: {config.experiment_name}')
     print('=' * 80 + '\n')
@@ -377,7 +379,8 @@ def _finetune_impl(config: TrainingConfig):
             '--output_dir', output_dir,
             '--report_to', 'wandb',
             '--run_name', config.experiment_name,
-            '--gradient_checkpointing', 'false',
+            '--gradient_checkpointing', str(config.gradient_checkpointing).lower(),
+            '--attn_impl', 'flash_attn',
             '--seed', str(config.seed),
             '--dataloader_num_workers', '8',
             '--load_from_cache_file', 'false',  # always re-preprocess; avoids stale cached dataset
@@ -428,7 +431,8 @@ def _finetune_impl(config: TrainingConfig):
             report_to=['wandb'],
             run_name=config.experiment_name,
 
-            gradient_checkpointing=False,
+            gradient_checkpointing=config.gradient_checkpointing,
+            attn_impl='flash_attn',
 
             seed=config.seed,
             dataloader_num_workers=8,
