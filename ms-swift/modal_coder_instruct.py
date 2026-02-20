@@ -55,17 +55,16 @@ train_image = (
     )
     .run_commands('CC=gcc CXX=g++ pip install causal-conv1d --no-build-isolation')
     .env({
-        'HF_HOME': '/root/model_cache',
+        'HF_HOME': '/model_cache',
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
         'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True',
         'USE_HF': '1',
     })
-    .run_commands(
-        "python -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Coder-Next', max_workers=10)\"",
-    )
 )
 
 checkpoint_vol = modal.Volume.from_name('qwen-swift-checkpoints', create_if_missing=True)
+model_vol = modal.Volume.from_name('qwen-model-cache', create_if_missing=True)
+MODEL_MOUNT = '/model_cache'
 TIMEOUT_HOURS = 6
 
 
@@ -140,7 +139,7 @@ class TrainingConfig:
     image=train_image,
     gpu='H100',
     cpu=8,
-    volumes={'/checkpoints': checkpoint_vol},
+    volumes={'/checkpoints': checkpoint_vol, MODEL_MOUNT: model_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -152,7 +151,7 @@ def finetune_h100(config: TrainingConfig):
     image=train_image,
     gpu='H200',
     cpu=8,
-    volumes={'/checkpoints': checkpoint_vol},
+    volumes={'/checkpoints': checkpoint_vol, MODEL_MOUNT: model_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -164,7 +163,7 @@ def finetune_h200(config: TrainingConfig):
     image=train_image,
     gpu='B200',
     cpu=8,
-    volumes={'/checkpoints': checkpoint_vol},
+    volumes={'/checkpoints': checkpoint_vol, MODEL_MOUNT: model_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -176,7 +175,7 @@ def finetune_b200(config: TrainingConfig):
     image=train_image,
     gpu='B200:2',
     cpu=16,
-    volumes={'/checkpoints': checkpoint_vol},
+    volumes={'/checkpoints': checkpoint_vol, MODEL_MOUNT: model_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
