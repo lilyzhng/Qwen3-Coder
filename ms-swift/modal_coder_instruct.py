@@ -108,7 +108,7 @@ class TrainingConfig:
 
     # Hardware
     gpu_type: str = 'B200'
-    num_gpus: int = 1
+    num_gpus: int = 2
 
     # HuggingFace Upload
     push_to_hub: bool = True
