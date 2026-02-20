@@ -10,18 +10,11 @@ ms-swift handles MoE models well: QLoRA, router aux loss, multi-GPU.
 Dataset: lilyzhng/UIGEN-T1.1-split (645 train / 80 val / 80 test, split from smirki/UIGEN-T1.1-TAILWIND).
 ms-swift loads the 'train' split by default. The 'test' split is reserved for eval (modal_eval_instruct.py).
 
-Model weights are stored in a persistent Modal volume (qwen-model-cache) so they survive
-image rebuilds. Download once with:
-    modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py::download_model
-
 IMPORTANT: Always use --detach. The 80B MoE model takes several minutes to load, apply
 LoRA, and JIT-compile the first training step. Without --detach, Modal's local heartbeat
 will time out and kill the job before training even starts.
 
 Usage:
-    # One-time model download (only needed when volume is empty)
-    modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py::download_model
-
     # Standard run — 1 epoch on train split, 2× B200
     modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
       --max-steps -1 --num-epochs 1 --gpu-type B200 --num-gpus 2
@@ -45,44 +38,34 @@ import modal
 # ---------------------------------------------------------------------------
 app = modal.App('qwen3-coder-swift-instruct')
 
-# Official ms-swift Docker — PyTorch 2.9.0, CUDA 12.8.1, flash_attn 2.8.3, swift 3.12.5 pre-installed.
-# Using this instead of NVIDIA PyTorch container solves the FSDPModule import error (needs PyTorch >=2.7)
-# and avoids compiling flash_attn from source.
-# US-West mirror for lowest latency from Modal (US region).
-# We upgrade swift to git HEAD for Qwen3-Coder-Next support and add a few extra packages.
-#
-# Qwen3-Coder-Next hybrid architecture: 1 in 4 layers = full attention, 3 in 4 = linear attention.
-# flash-linear-attention: pure Python PyPI wheel; causal-conv1d: pre-built cu12 wheel from GitHub.
-_SWIFT_IMAGE = (
-    'modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/modelscope:'
-    'ubuntu22.04-cuda12.8.1-py311-torch2.9.0-vllm0.13.0-modelscope1.33.0-swift3.12.5'
-)
-_CAUSAL_CONV1D_WHEEL = (
-    'https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.0/'
-    'causal_conv1d-1.6.0+cu12torch2.6cxx11abiTRUE-cp311-cp311-linux_x86_64.whl'
-)
+# Same image as modal_coder_base (ms-swift, Qwen3-Next support)
 train_image = (
-    modal.Image.from_registry(_SWIFT_IMAGE)
+    modal.Image.from_registry('nvidia/cuda:12.8.0-devel-ubuntu22.04', add_python='3.11')
+    .apt_install('git', 'build-essential')
     .pip_install(
         'ms-swift @ git+https://github.com/modelscope/ms-swift.git',
+        'transformers>=4.57,<4.58',
+        'trl<0.25',
+        'bitsandbytes',
+        'datasets',
         'wandb',
         'hf-transfer',
+        'huggingface_hub',
         'flash-linear-attention',
-        _CAUSAL_CONV1D_WHEEL,
     )
+    .run_commands('CC=gcc CXX=g++ pip install causal-conv1d --no-build-isolation')
     .env({
-        'HF_HOME': '/model_cache',
+        'HF_HOME': '/root/model_cache',
         'HF_HUB_ENABLE_HF_TRANSFER': '1',
         'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True',
         'USE_HF': '1',
     })
+    .run_commands(
+        "python -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Coder-Next', max_workers=10)\"",
+    )
 )
 
 checkpoint_vol = modal.Volume.from_name('qwen-swift-checkpoints', create_if_missing=True)
-# Model weights volume — download once, reuse across all image rebuilds.
-# Mount path matches HF_HOME so HuggingFace hub finds weights automatically.
-model_vol = modal.Volume.from_name('qwen-model-cache', create_if_missing=True)
-MODEL_MOUNT = '/model_cache'
 TIMEOUT_HOURS = 6
 
 
@@ -106,9 +89,8 @@ class TrainingConfig:
     learning_rate: float = 2e-4
     num_epochs: int = 1
     max_steps: int = -1  # -1 = use num_epochs; set to a positive int for a quick smoke-test
-    batch_size: int = 4  # grad_checkpointing frees ~60 GB so batch_size=4 fits at seq_len=4096
+    batch_size: int = 2
     gradient_accumulation_steps: int = 1
-    gradient_checkpointing: bool = True  # required at seq_len=4096 to fit batch_size=4 on B200
     warmup_steps: int = 10
     weight_decay: float = 0.01
     lr_scheduler_type: str = 'cosine'
@@ -127,7 +109,7 @@ class TrainingConfig:
 
     # Hardware
     gpu_type: str = 'B200'
-    num_gpus: int = 2
+    num_gpus: int = 1
 
     # HuggingFace Upload
     push_to_hub: bool = True
@@ -152,40 +134,13 @@ class TrainingConfig:
 
 
 # ---------------------------------------------------------------------------
-# One-time model download — run manually when volume is empty:
-#   modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py::download_model
-# ---------------------------------------------------------------------------
-@app.function(
-    image=train_image,
-    cpu=4,
-    volumes={MODEL_MOUNT: model_vol},
-    secrets=[modal.Secret.from_name('hf-secret')],
-    timeout=2 * 60 * 60,
-)
-def download_model(model_name: str = 'Qwen/Qwen3-Coder-Next'):
-    """Download model weights to the persistent volume. Run once; reused by all training jobs."""
-    import os
-    from huggingface_hub import snapshot_download
-    local_dir = os.path.join(MODEL_MOUNT, 'hub', f'models--{model_name.replace("/", "--")}')
-    if os.path.exists(local_dir):
-        print(f'Model already cached at {local_dir}. Nothing to do.')
-    else:
-        print(f'Downloading {model_name} to {MODEL_MOUNT} ...')
-        snapshot_download(model_name, max_workers=10)
-        model_vol.commit()
-        print('Download complete and committed to volume.')
-
-
-# ---------------------------------------------------------------------------
 # GPU-specific Modal functions
 # ---------------------------------------------------------------------------
-_VOLUMES = {'/checkpoints': checkpoint_vol, MODEL_MOUNT: model_vol}
-
 @app.function(
     image=train_image,
     gpu='H100',
     cpu=8,
-    volumes=_VOLUMES,
+    volumes={'/checkpoints': checkpoint_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -197,7 +152,7 @@ def finetune_h100(config: TrainingConfig):
     image=train_image,
     gpu='H200',
     cpu=8,
-    volumes=_VOLUMES,
+    volumes={'/checkpoints': checkpoint_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -209,7 +164,7 @@ def finetune_h200(config: TrainingConfig):
     image=train_image,
     gpu='B200',
     cpu=8,
-    volumes=_VOLUMES,
+    volumes={'/checkpoints': checkpoint_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -221,7 +176,7 @@ def finetune_b200(config: TrainingConfig):
     image=train_image,
     gpu='B200:2',
     cpu=16,
-    volumes=_VOLUMES,
+    volumes={'/checkpoints': checkpoint_vol},
     secrets=[modal.Secret.from_name('wandb-secret'), modal.Secret.from_name('hf-secret')],
     timeout=TIMEOUT_HOURS * 60 * 60,
 )
@@ -235,114 +190,6 @@ _gpu_functions = {
     'B200': finetune_b200,
     'B200:2': finetune_b200_2gpu,
 }
-
-
-# ---------------------------------------------------------------------------
-# Dataset diagnostic
-# ---------------------------------------------------------------------------
-def _diagnose_dataset(dataset_str: str, max_length: int, batch_size: int, num_gpus: int = 1):
-    """Log dataset sample counts at each pipeline stage before training starts.
-
-    Prints:
-      1. Raw HF split sizes (how many rows the hub has)
-      2. Row-by-row preprocessor run to capture the EXACT drop reason for each failed row
-      3. ms-swift load_dataset output (after AutoPreprocessor)
-      4. Expected steps/epoch given batch_size
-    """
-    import math
-    from collections import Counter
-
-    print('\n' + '─' * 80)
-    print('DATASET DIAGNOSTIC (pre-training)')
-    print('─' * 80)
-
-    # ── Stage 1: raw HF dataset ─────────────────────────────────────────────
-    try:
-        from datasets import load_dataset as hf_load_dataset
-        raw = hf_load_dataset(dataset_str.split('#')[0])
-        for split_name, split_ds in raw.items():
-            print(f'  HF raw  [{split_name:>12s}]: {len(split_ds):>6} rows')
-        raw_train = raw['train']
-        n_raw = len(raw_train)
-    except Exception as e:
-        print(f'  HF raw load failed: {e}')
-        print('─' * 80 + '\n')
-        return
-
-    # ── Stage 2: row-by-row preprocessor to capture exact drop reasons ──────
-    try:
-        from swift.dataset.preprocessor.core import AutoPreprocessor
-        preprocessor = AutoPreprocessor()
-        # _get_preprocessor picks MessagesPreprocessor for our dataset
-        row_preprocessor = preprocessor._get_preprocessor(raw_train)
-
-        drop_reasons = Counter()
-        dropped_examples = []  # store up to 3 examples for inspection
-
-        for i, row in enumerate(raw_train):
-            row = dict(row)
-            try:
-                result = row_preprocessor.preprocess(row)
-                if result is None:
-                    reason = 'preprocess() returned None'
-                    drop_reasons[reason] += 1
-                    if len(dropped_examples) < 3:
-                        dropped_examples.append((i, reason, row))
-            except Exception as e:
-                reason = type(e).__name__ + ': ' + str(e)[:120]
-                drop_reasons[reason] += 1
-                if len(dropped_examples) < 3:
-                    dropped_examples.append((i, reason, row))
-
-        n_dropped = sum(drop_reasons.values())
-        n_kept = n_raw - n_dropped
-
-        print(f'\n  Preprocessor results ({row_preprocessor.__class__.__name__}):')
-        print(f'    kept   : {n_kept:>6} / {n_raw}')
-        print(f'    dropped: {n_dropped:>6} / {n_raw}')
-
-        if n_dropped > 0:
-            print(f'\n  Drop reasons:')
-            for reason, count in drop_reasons.most_common():
-                print(f'    [{count:>4}×] {reason}')
-            print(f'\n  First dropped row examples:')
-            for idx, reason, row in dropped_examples:
-                msgs = row.get('messages', [])
-                msg_preview = f'{len(msgs)} messages' if msgs else 'NO messages'
-                content_len = sum(len(str(m.get('content', ''))) for m in msgs)
-                print(f'    row {idx:>4}: {reason}')
-                print(f'             messages={msg_preview}, total_content_chars={content_len}')
-        else:
-            print('    ✓ All rows pass the preprocessor.')
-
-    except Exception as e:
-        print(f'  Row-by-row preprocess failed: {e}')
-
-    # ── Stage 3: ms-swift load_dataset end-to-end ───────────────────────────
-    try:
-        from swift.dataset import load_dataset as swift_load_dataset
-        train_ds, val_ds = swift_load_dataset(
-            [dataset_str],
-            use_hf=True,
-            split_dataset_ratio=0.0,
-            num_proc=4,
-            load_from_cache_file=False,
-        )
-        n_train = len(train_ds) if train_ds is not None else 0
-        print(f'\n  swift load_dataset [train]: {n_train:>6} rows')
-
-        global_batch = batch_size * num_gpus
-        expected_steps = math.ceil(n_train / global_batch)
-        print(f'\n  max_length        : {max_length}')
-        print(f'  batch_size/gpu    : {batch_size}')
-        print(f'  num_gpus          : {num_gpus}')
-        print(f'  global batch size : {global_batch}')
-        print(f'  expect steps      : ~{expected_steps} / epoch')
-
-    except Exception as e:
-        print(f'  swift load_dataset failed: {e}')
-
-    print('─' * 80 + '\n')
 
 
 # ---------------------------------------------------------------------------
@@ -383,13 +230,9 @@ def _finetune_impl(config: TrainingConfig):
     print(f'Learning rate: {config.learning_rate} ({config.lr_scheduler_type})')
     print(f'MoE router aux loss coef: {config.router_aux_loss_coef}')
     print(f'Sequence length: {config.max_seq_length}')
-    print(f'Gradient checkpointing: {config.gradient_checkpointing}')
-    print(f'Attention: flash_attn')
     print(f'Output: {output_dir}')
     print(f'Experiment: {config.experiment_name}')
     print('=' * 80 + '\n')
-
-    _diagnose_dataset(dataset_str, config.max_seq_length, config.batch_size, config.num_gpus)
 
     if config.num_gpus > 1:
         import subprocess
@@ -427,9 +270,7 @@ def _finetune_impl(config: TrainingConfig):
             '--output_dir', output_dir,
             '--report_to', 'wandb',
             '--run_name', config.experiment_name,
-            '--gradient_checkpointing', str(config.gradient_checkpointing).lower(),
-            '--gradient_checkpointing_kwargs', '{"determinism_check": "none"}',
-            '--attn_impl', 'flash_attn',
+            '--gradient_checkpointing', 'false',
             '--seed', str(config.seed),
             '--dataloader_num_workers', '8',
             '--load_from_cache_file', 'false',  # always re-preprocess; avoids stale cached dataset
@@ -480,9 +321,7 @@ def _finetune_impl(config: TrainingConfig):
             report_to=['wandb'],
             run_name=config.experiment_name,
 
-            gradient_checkpointing=config.gradient_checkpointing,
-            gradient_checkpointing_kwargs={'determinism_check': 'none'},
-            attn_impl='flash_attn',
+            gradient_checkpointing=False,
 
             seed=config.seed,
             dataloader_num_workers=8,
