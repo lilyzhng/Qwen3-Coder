@@ -273,6 +273,7 @@ def _finetune_impl(config: TrainingConfig):
             '--gradient_checkpointing', 'false',
             '--seed', str(config.seed),
             '--dataloader_num_workers', '8',
+            '--load_from_cache_file', 'false',  # always re-preprocess; avoids stale cached dataset
         ]
 
         print(f'Running with {config.num_gpus} GPUs via torchrun...')
@@ -285,6 +286,7 @@ def _finetune_impl(config: TrainingConfig):
             model=config.model_name,
             dataset=[dataset_str],
             use_hf=True,
+            load_from_cache_file=False,  # always re-preprocess; avoids stale cached dataset
 
             tuner_type='lora',
             lora_rank=config.lora_rank,
