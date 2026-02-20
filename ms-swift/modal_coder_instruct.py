@@ -7,6 +7,10 @@ For raw continuous text pre-training, use modal_coder_base.py (swift pt) instead
 
 ms-swift handles MoE models well: QLoRA, router aux loss, multi-GPU.
 
+IMPORTANT: Always use --detach. The 80B MoE model takes several minutes to load, apply
+LoRA, and JIT-compile the first training step. Without --detach, Modal's local heartbeat
+will time out and kill the job before training even starts.
+
 Usage:
     # UIGEN-T1.1-TAILWIND (question/answer) — 1 epoch, 2× B200
     modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
@@ -14,10 +18,12 @@ Usage:
       --max-steps -1 --num-epochs 1 --gpu-type B200 --num-gpus 2
 
     # Quick test (30 steps)
-    modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py --dataset-name smirki/UIGEN-T1.1-TAILWIND --max-steps 30
+    modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
+      --dataset-name smirki/UIGEN-T1.1-TAILWIND --max-steps 30
 
     # Limit dataset size
-    modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py --dataset-name smirki/UIGEN-T1.1-TAILWIND --train-size 1000
+    modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
+      --dataset-name smirki/UIGEN-T1.1-TAILWIND --train-size 1000
 """
 
 from dataclasses import dataclass
@@ -385,13 +391,16 @@ def main(
 
     Use for chat datasets (question/answer or messages). For raw text pre-training use modal_coder_base.py.
 
+    Always use --detach (80B MoE takes minutes to load; without it, heartbeat timeout kills the job).
+
     Examples:
         # UIGEN-T1.1-TAILWIND, 1 epoch, 2× B200
         modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
             --dataset-name smirki/UIGEN-T1.1-TAILWIND --num-epochs 1 --max-steps -1 --gpu-type B200 --num-gpus 2
 
-        # Quick test
-        modal run Qwen3-Coder/ms-swift/modal_coder_instruct.py --dataset-name smirki/UIGEN-T1.1-TAILWIND --max-steps 30
+        # Quick test (30 steps)
+        modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
+            --dataset-name smirki/UIGEN-T1.1-TAILWIND --max-steps 30
     """
     config_dict = {}
     for key, val in {
