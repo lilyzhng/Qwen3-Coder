@@ -232,5 +232,89 @@
         "content": "This was a multi-day debugging effort that uncovered a chain of three interdependent issues:\n\n**Issue 1 — Dependency ordering (silent downgrade):**\nunsloth-zoo pins `transformers<=4.57.6` and `trl<=0.24.0`. Installing transformers/trl dev versions BEFORE unsloth-zoo causes them to be silently downgraded. Fix: install transformers/trl LAST with `--no-deps`.\n\n**Issue 2 — Version mismatch (NameError):**\nInstalling from `git+https://github.com/huggingface/transformers.git` (HEAD) grabbed 5.3.0.dev0, which renamed `Qwen3NextExperts`. Fix: pin to `transformers==5.2.0` matching Datta0's tested version.\n\n**Issue 3 — Unsloth itself needs patching (unsolvable without Datta0's local code):**\nEven with correct versions, Unsloth's compiled module generator (`unsloth_compiled_cache/unsloth_compiled_module_qwen3_next.py`) references `Qwen3NextExperts` without importing it. The `unsloth` package on PyPI (2026.2.1) was built for transformers<=4.57.6 where this class doesn't exist in the same form. Datta0 runs a LOCAL editable install of `unsloth` at `/home/datta0/unsloth` that presumably fixes this. Without that patched `unsloth`, it's impossible to get past model loading.\n\n**Three packages need coordinated patches:**\n1. `unsloth-zoo` — patched via `datta0/unsloth-zoo@transformers_v5_patches` (public)\n2. `transformers` — pinned to `==5.2.0` (public)\n3. `unsloth` — needs Datta0's local patches (NOT public)\n\n**Conclusion:** Unsloth MoE training for Qwen3-Coder-Next-Base is blocked until the Unsloth team releases an updated `unsloth` package with transformers v5 support. ms-swift with QLoRA is the working path (18 minutes on 2x B200, model pushed to HuggingFace).\n\n**Lesson for ML infrastructure:** When a framework vendor says 'use these versions', always verify the ACTUAL installed versions in the running container. pip's dependency resolver can silently downgrade packages during later install steps. Use `--no-deps` for override installs and add build-time assertions. Also check whether the vendor is running from editable/local installs — their setup may include unreleased patches."
       }
     ]
+  },
+  {
+    "bug_id": "ms-swift-20",
+    "title": "Qwen3-Coder-Next-Base (80B MoE, 3B active) underperforms Qwen2.5-Coder-14B (dense) after LoRA fine-tuning",
+    "timestamp": "2026-02-19 00:00 PST",
+    "commit": null,
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are an ML infrastructure engineer. Project: evaluating fine-tuned models on a UI code generation task (HTML/Tailwind CSS). Comparing Qwen2.5-Coder-14B (dense, LoRA r=32) vs Qwen3-Coder-Next-Base (80B MoE, 3B active, LoRA r=8), both fine-tuned on the same dataset (lilyzhng/uigen-ui-code-gen-full, 715 samples) using ms-swift QLoRA."
+      },
+      {
+        "role": "user",
+        "content": "The Qwen3-Coder-Next-Base fine-tuned model produces worse results than Qwen2.5-Coder-14B on the same eval. Looking at raw output from test_0 (productivity timer app):\n\nBase model output starts with commented-out steps and explanations before the HTML, and adds prose after the closing </html> tag:\n```\n# Steps:\n# Create an HTML file with the necessary structure.\n# Implement a circular countdown...\n...\n<!DOCTYPE html>\n...\n</html>\n# Explanation of Code and Design Choices:\n# HTML Structure:\n...\n```\n\nThe LoRA-finetuned output generates valid HTML but uses wrong Tailwind import (`@tailwindcss/browser@4` instead of CDN), and stacks multiple timer circles vertically instead of a clean single-timer UI. Judge score: 4/10.\n\nQwen2.5-Coder-14B with r=32 LoRA on the same dataset previously scored 6-8/10 on similar tasks. Why is the newer, larger model worse?"
+      },
+      {
+        "role": "assistant",
+        "content": "Four compounding factors explain why Qwen3-Coder-Next-Base underperforms Qwen2.5-Coder-14B after fine-tuning:\n\n**1. 3B active parameters < 14B dense (most impactful)**\nDespite 80B total parameters, the MoE model only activates ~3B parameters per token. Code generation quality depends on active compute per token — 14B dense does ~4.7x more compute per forward pass than 3B active MoE. The 80B total capacity stores more knowledge across 512 experts, but each token only accesses 10 experts (+ 1 shared), limiting per-token reasoning depth.\n\n**2. Base model has zero instruction-following ability**\nQwen3-Coder-Next-Base is a pure next-token predictor. It doesn't understand 'generate HTML code' as an instruction — it treats it as text to continue. The raw output confirms this: the base model generates commented-out steps, explanations, and prose alongside the HTML, as if writing a tutorial document rather than executing a code generation task.\n\nQwen2.5-Coder-14B likely had instruction-following capability (either as an instruct variant or from its pre-training mix), so LoRA fine-tuning only needed to teach the output format, not the concept of following instructions.\n\n**3. LoRA r=8 is too small for a base model to learn instruction following**\nWith LoRA rank 8 and limited training data (715 samples), the adapter must simultaneously learn:\n- How to follow instructions (base model has none of this)\n- The specific HTML/Tailwind code generation task\n- When to stop generating (no EOS behavior in base models)\n\nThe Qwen2.5-Coder-14B fine-tuning used r=32 (4x more capacity), and the model already knew how to follow instructions. Much less to learn.\n\n**4. MoE models overfit on small datasets**\nResearch from the Switch Transformer paper and HuggingFace MoE analysis shows MoE models 'only perform well when the dataset is very large, otherwise their performance deteriorates due to overfitting.' With 715 samples, the MoE routing can also collapse — all tokens get sent to the same few experts, destroying the architecture's benefit. Dense models are more robust to small-dataset fine-tuning.\n\n**When to use base models for post-training:**\nBase models are the right choice for large-scale post-training pipelines with thousands of examples + RL (like Qwen's own process: 800K coding tasks + RL from environment feedback). For quick LoRA experiments with hundreds of samples, instruct models are more practical because they already have instruction-following scaffolding.\n\n**Recommendations:**\n\n| Change | Expected impact |\n|---|---|\n| Use Qwen3-Coder-Next (instruct) instead of Base | Fixes instruction-following gap |\n| Increase LoRA rank to r=32 or r=64 | More adapter capacity for task learning |\n| Use a dense model (Qwen3-14B or Qwen2.5-Coder-14B) | More robust fine-tuning, simpler setup |\n| Increase training data (5k+ samples) | Base model needs more signal |\n| More training epochs | Base model needs more exposure |\n\n**Lesson:** Bigger model ≠ better fine-tuning results. For small-dataset LoRA fine-tuning, the effective quality depends on: (1) active parameters per token (dense > sparse MoE at same active count), (2) pre-existing instruction-following ability (instruct > base), (3) adapter capacity relative to what the model needs to learn (r=32 > r=8 when teaching both instruction-following AND the task). A 14B dense instruct model with r=32 LoRA will outperform an 80B MoE base model with r=8 LoRA on small datasets."
+      }
+    ]
+  },
+  {
+    "bug_id": "eval-1",
+    "title": "vLLM MoE+LoRA Triton kernel fails on B200 (gdc_wait pipeliner)",
+    "timestamp": "2026-02-19 20:26 PST",
+    "commit": null,
+    "path": "eval",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Project: UI code generation eval for Qwen3-Coder-Next-Base (80B MoE) fine-tuned with LoRA, run on Modal with vLLM. GPU: B200. Script: Qwen3-Coder/eval/modal_eval_moe.py."
+      },
+      {
+        "role": "user",
+        "content": "Modal eval with LoRA fails when loading the model on B200:\n\n/usr/local/lib/python3.11/site-packages/vllm/lora/ops/triton_ops/fused_moe_lora_op.py:181:12: error: 'tt.elementwise_inline_asm' op pipeliner doesn't know how to predicate this op.\n            tl.extra.cuda.gdc_wait()\n           ^\nLLVM ERROR: Fatal pipeliner error\n\nRuntimeError: PassManager::run failed\n\nTraceback shows: add_lora_fused_moe -> fused_moe_lora -> _fused_moe_lora_kernel[grid] -> triton compile. Pipeline target is cuda:100 (Blackwell/B200)."
+      },
+      {
+        "role": "assistant",
+        "content": "**Root cause:** vLLM's fused MoE LoRA path uses a Triton kernel that calls `tl.extra.cuda.gdc_wait()` (grid dependency control). The Triton/LLVM pipeliner for compute capability 10.0 (B200/Blackwell) does not know how to predicate that inline asm op, so compilation fails during vLLM engine init (profile_run / determine_available_memory), not at generate time. This is in vLLM's installed code (fused_moe_lora_op.py), not in our repo.\n\n**Wrong path:** Setting `enforce_eager=True` does not avoid this — the LoRA MoE kernel is JIT-compiled when the engine loads the model with enable_lora=True, before any forward run.\n\n**Fix (in our code):** Detect B200/Blackwell when LoRA is requested and fail fast with a clear message instead of crashing deep in Triton. In modal_eval_moe.py, before building llm_kwargs with enable_lora, check `torch.cuda.get_device_name(0)` for 'B200' or 'Blackwell'. If has_lora and on B200, raise ValueError telling the user to run the full comparison (base + LoRA) on a GPU where MoE+LoRA works (e.g. H100 or H200 with enough VRAM or FP8 base). Note: --base-only on B200 is not a solution when the goal is to compare base vs fine-tuned; it only evaluates the base model and cannot evaluate the LoRA adapter."
+      }
+    ]
+  },
+  {
+    "bug_id": "eval-2",
+    "title": "B200 + vLLM + PyTorch version composition: do not recommend upgrade path",
+    "timestamp": "2026-02-19 20:37 PST",
+    "commit": null,
+    "path": "eval",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Project: eval and inference for Qwen3-Coder-Next-Base (80B MoE) with LoRA on Modal. Context: B200 has sm_100; vLLM MoE+LoRA Triton kernel fails on B200 (eval-1). Standard PyTorch from PyPI does not include sm_100; NVIDIA provides custom PyTorch in NGC containers for B200."
+      },
+      {
+        "role": "user",
+        "content": "Can we fix B200 LoRA eval by upgrading vLLM or PyTorch? Should we document that upgrading is a valid approach?"
+      },
+      {
+        "role": "assistant",
+        "content": "**Do not recommend or imply that upgrading vLLM/PyTorch will fix B200 compatibility.**\n\nThe composition is unreliable: B200 requires PyTorch built with sm_100 (NVIDIA custom or specific builds), while vLLM's MoE+LoRA path has its own Triton/Blackwell issues (gdc_wait pipeliner). Mixing \"upgrade vLLM\" or \"upgrade PyTorch\" to try to get a compatible stack is a rabbit hole — dependency versions, NGC vs PyPI, --no-deps installs, and kernel support are all entangled. We should never suggest that users go through that; it is definitely not recommended and we must never imply it will work.\n\n**Documented stance:** Prefer deterministic workarounds: (1) run the full base-vs-LoRA comparison on a GPU where MoE+LoRA works (H100 or H200 with enough VRAM, or FP8 base to fit), or (2) use a pre-quantized FP8 base to fit on smaller GPUs and run comparison there. Do not recommend \"base-only on B200\" as a workaround when the user needs to compare base and fine-tuned — that only evaluates base and cannot evaluate the LoRA adapter. Do not recommend chasing vLLM/PyTorch version combinations for B200."
+      }
+    ]
+  },
+  {
+    "bug_id": "ms-swift-21",
+    "title": "modal_coder_instruct: use Qwen3-Coder-Next (instruct) not Base; follow document-bug-fixes",
+    "timestamp": "2026-02-19 21:08 PST",
+    "commit": "0ba5b85",
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Project: Qwen3-Coder fine-tuning on Modal with ms-swift. Scripts: modal_coder_base.py (swift pt), modal_coder_instruct.py (swift sft). Rule: .cursor/rules/document-bug-fixes.mdc — after a fix, commit, then append to Qwen3-Coder/training_data.json with bug_id, title, timestamp, commit, messages."
+      },
+      {
+        "role": "user",
+        "content": "I realize you are not following this rule. You should capture our conversation, commit the changes, document the commit, and put it in the training data file.\n\nFine-tune Qwen3-Coder-Next-Base (80B MoE) on Modal using ms-swift SFT (instruction tuning). This is also incorrect. We are Fine-tune Qwen3-Coder-Next on Modal using ms-swift SFT (instruction tuning), not the basemodel"
+      },
+      {
+        "role": "assistant",
+        "content": "**Two fixes applied:**\n\n1. **Follow document-bug-fixes:** Commit the code changes in the appropriate repo (Qwen3-Coder), then append a new entry to training_data.json with the conversation, commit hash, and timestamp from `date`.\n\n2. **Correct model name:** The SFT script (modal_coder_instruct.py) is for instruction-tuning the **instruct** model, not the base model. Updated all references and the default model from `Qwen/Qwen3-Coder-Next-Base` to `Qwen/Qwen3-Coder-Next` in modal_coder_instruct.py:\n- Docstring: \"Fine-tune Qwen3-Coder-Next (80B MoE, instruct) on Modal using ms-swift SFT\"\n- Image pre-download: `snapshot_download('Qwen/Qwen3-Coder-Next', ...)`\n- TrainingConfig.model_name default: `'Qwen/Qwen3-Coder-Next'`\n- All user-facing print/docs: \"Qwen3-Coder-Next\" not \"Qwen3-Coder-Next-Base\"\n\nmodal_coder_base.py remains the PT script and still uses Qwen3-Coder-Next-Base; only the instruct script uses the instruct model.\n\nCommitted in Qwen3-Coder as 0ba5b85; this entry added to training_data.json."
+      }
+    ]
   }
 ]
