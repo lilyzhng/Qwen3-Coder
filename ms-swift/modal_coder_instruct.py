@@ -76,7 +76,7 @@ TIMEOUT_HOURS = 6
 class TrainingConfig:
     # Model — 80B MoE, 3B active
     model_name: str = 'Qwen/Qwen3-Coder-Next'
-    max_seq_length: int = 2048
+    max_seq_length: int = 4096
 
     # LoRA
     lora_rank: int = 8
@@ -193,6 +193,79 @@ _gpu_functions = {
 
 
 # ---------------------------------------------------------------------------
+# Dataset diagnostic
+# ---------------------------------------------------------------------------
+def _diagnose_dataset(dataset_str: str, max_length: int, batch_size: int):
+    """Log dataset sample counts at each pipeline stage before training starts.
+
+    Prints:
+      1. Raw HF split sizes (how many rows the hub has)
+      2. ms-swift load_dataset output (after AutoPreprocessor)
+      3. Expected steps/epoch given batch_size
+
+    Any discrepancy between (1) and (2) tells us exactly where samples
+    are being dropped or filtered.
+    """
+    print('\n' + '─' * 80)
+    print('DATASET DIAGNOSTIC (pre-training)')
+    print('─' * 80)
+
+    # ── Stage 1: raw HF dataset ─────────────────────────────────────────────
+    try:
+        from datasets import load_dataset as hf_load_dataset
+        raw = hf_load_dataset(dataset_str.split('#')[0])
+        for split_name, split_ds in raw.items():
+            print(f'  HF raw  [{split_name:>12s}]: {len(split_ds):>6} rows')
+    except Exception as e:
+        print(f'  HF raw load failed: {e}')
+
+    # ── Stage 2: ms-swift load_dataset (after AutoPreprocessor) ─────────────
+    try:
+        from swift.dataset import load_dataset as swift_load_dataset
+        train_ds, val_ds = swift_load_dataset(
+            [dataset_str],
+            use_hf=True,
+            split_dataset_ratio=0.0,
+            num_proc=4,
+            load_from_cache_file=False,
+        )
+        n_train = len(train_ds) if train_ds is not None else 0
+        n_val = len(val_ds) if val_ds is not None else 0
+        print(f'  swift   [       train]: {n_train:>6} rows  (after AutoPreprocessor)')
+        if n_val:
+            print(f'  swift   [         val]: {n_val:>6} rows')
+
+        # ── Stage 3: expected steps ─────────────────────────────────────────
+        import math
+        expected_steps = math.ceil(n_train / batch_size)
+        print(f'\n  max_length  : {max_length}')
+        print(f'  batch_size  : {batch_size}')
+        print(f'  train rows  : {n_train}')
+        print(f'  expect steps: ~{expected_steps} / epoch')
+
+        # Warn on significant drop
+        try:
+            raw_train = len(hf_load_dataset(dataset_str.split('#')[0])['train'])
+            dropped = raw_train - n_train
+            if dropped > 0:
+                pct = 100 * dropped / raw_train
+                print(f'\n  ⚠ {dropped} rows dropped by ms-swift ({pct:.1f}% of raw train)')
+                print(f'    Likely cause: samples tokenise to >{max_length} tokens '
+                      f'and ms-swift drops (not truncates) them.')
+                print(f'    To investigate: set strict=True in AutoPreprocessor '
+                      f'or increase max_length.')
+            else:
+                print(f'\n  ✓ No rows dropped — all {n_train} samples will be trained.')
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f'  swift load_dataset failed: {e}')
+
+    print('─' * 80 + '\n')
+
+
+# ---------------------------------------------------------------------------
 # Training Implementation (swift sft)
 # ---------------------------------------------------------------------------
 def _finetune_impl(config: TrainingConfig):
@@ -233,6 +306,8 @@ def _finetune_impl(config: TrainingConfig):
     print(f'Output: {output_dir}')
     print(f'Experiment: {config.experiment_name}')
     print('=' * 80 + '\n')
+
+    _diagnose_dataset(dataset_str, config.max_seq_length, config.batch_size)
 
     if config.num_gpus > 1:
         import subprocess
