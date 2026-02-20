@@ -379,5 +379,26 @@
         "content": "**Root cause:** `enforce_eager=True` was set in the vLLM `LLM()` kwargs. This flag disables CUDA graphs and forces optimization level to -O0, bypassing all compilation optimizations. It was originally added as a workaround for Triton kernel bugs on **B200/Blackwell** GPUs (the fused MoE LoRA Triton kernel crashes with `tt.elementwise_inline_asm` errors on Blackwell).\n\nHowever, the script runs on **H200** (Hopper architecture), where these Triton kernels work fine. The flag was left over from when `GPU_CONFIG` was set to `B200`.\n\nThe speed difference vs the old Qwen2.5-Coder eval has two factors:\n1. **Model size**: 80B MoE vs ~14B dense — all 80B params must sit in VRAM even though only 3B are active per token\n2. **enforce_eager=True**: Disables CUDA graphs, which alone cause 2-4x slowdown on decode-heavy workloads\n\n**Fix:** Removed `enforce_eager=True` from both `modal_eval_instruct.py` and `modal_eval_moe.py`. The B200 runtime guard (which raises ValueError if LoRA+MoE runs on Blackwell) remains in place as a safety check. Expected speedup: 2-4x faster decoding on H200."
       }
     ]
+  },
+  {
+    "bug_id": "ms-swift-25",
+    "title": "vLLM pack_moe AssertionError: MoE LoRA with gate_up_proj/down_proj crashes at runtime",
+    "timestamp": "2026-02-20 00:00 PST",
+    "commit": "e6b6581",
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Project: Qwen3-Coder-Next (80B MoE) evaluation on Modal. LoRA adapter trained via ms-swift SFT targeting q_proj, k_proj, v_proj, o_proj, gate_up_proj, down_proj. Inference: vLLM v0.15.1 with FP8 on H200."
+      },
+      {
+        "role": "user",
+        "content": "Instruct model generation succeeded (27 min for 2 samples), but the LoRA generation pass crashed immediately:\n\n(EngineCore_DP0 pid=68) ERROR 02-20 07:53:48 [core.py:948] EngineCore encountered a fatal error.\n...\n  File \"/usr/local/lib/python3.11/site-packages/vllm/lora/model_manager.py\", line 604, in _create_merged_loras_inplace\n    lora_model.loras[module_name] = PackedLoRALayerWeights.pack_moe(\n  File \"/usr/local/lib/python3.11/site-packages/vllm/lora/lora_weights.py\", line 188, in pack_moe\n    assert w1_lora is not None\n           ^^^^^^^^^^^^^^^^^^^\nAssertionError\n\nThe adapter was trained with target_modules: [\"v_proj\", \"o_proj\", \"k_proj\", \"gate_up_proj\", \"down_proj\", \"q_proj\"]"
+      },
+      {
+        "role": "assistant",
+        "content": "**Root cause:** vLLM's runtime LoRA adapter loading for MoE models uses `PackedLoRALayerWeights.pack_moe()`, which expects MoE expert weights named as `w1`, `w2`, `w3`. However, the Qwen3-Coder-Next architecture uses `gate_up_proj` (fused w1+w3) and `down_proj` (w2). When the adapter trained by ms-swift targets these modules, vLLM can't map the weight names correctly and `w1_lora` ends up as `None`, triggering the assertion.\n\nThis is a vLLM limitation — it doesn't support runtime LoRA adapters that target MoE expert FFN layers with non-standard naming.\n\n**Wrong path considered:** Using vLLM's `LoRARequest` for runtime adapter switching — this is the entire broken code path.\n\n**Fix — merge-then-load approach:**\n1. Run instruct model generation with vLLM (FP8, no LoRA)\n2. Destroy the vLLM instance to free GPU memory\n3. Load the base model on CPU using transformers, apply LoRA via PEFT, merge weights via `merge_and_unload()`\n4. Save merged model to `/tmp/merged_model`\n5. Reload with a new vLLM instance using FP8 dynamic quantization\n6. Generate finetuned model outputs\n\nAlso added `peft` to the Modal image dependencies and removed the now-unnecessary B200 LoRA guard and unused `lora_rank` variable."
+      }
+    ]
   }
 ]
