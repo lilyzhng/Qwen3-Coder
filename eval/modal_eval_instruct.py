@@ -36,7 +36,7 @@ eval_image = (
     modal.Image.from_registry('nvidia/cuda:12.8.0-devel-ubuntu22.04', add_python='3.11')
     .apt_install('git', 'build-essential')
     .pip_install(
-        'vllm',
+        'vllm==0.15.1',
         'flashinfer-python',
         'peft',
         'datasets',
@@ -58,6 +58,7 @@ eval_image = (
 # Persistent volumes
 model_cache_vol = modal.Volume.from_name("uiux-model-cache", create_if_missing=True)
 results_vol = modal.Volume.from_name("uiux-eval-results", create_if_missing=True)
+vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
 # GPU config — H200 for FP8 instruct + LoRA eval
 GPU_CONFIG = "H200"
@@ -73,7 +74,7 @@ class EvalConfig:
     """Configuration for instruct model evaluation."""
     base_model: str = "Qwen/Qwen3-Coder-Next"
     lora_model: str = None  # HuggingFace LoRA adapter ID (e.g. lilyzhng/Qwen3-Coder-Next-sft-r8-...)
-    hf_dataset: str = "lilyzhng/uigen-ui-code-gen-full"
+    hf_dataset: str = "lilyzhng/UIGEN-T1.1-split"
     output_base_dir: str = "/results"
     limit: int = 20
     judge_model: str = "google/gemini-3-pro-preview"
@@ -81,7 +82,7 @@ class EvalConfig:
     use_judge: bool = True
     base_only: bool = False  # Only evaluate instruct model, skip LoRA
     use_fp8: bool = True  # FP8 inference (default on — instruct model fits on H200 in FP8)
-    max_new_tokens: int = 8192
+    max_new_tokens: int = 2048
 
 
 @app.function(
@@ -92,6 +93,7 @@ class EvalConfig:
     volumes={
         "/model_cache": model_cache_vol,
         "/results": results_vol,
+        "/root/.cache/vllm": vllm_cache_vol,
     },
     secrets=[
         modal.Secret.from_name("wandb-secret"),
@@ -223,37 +225,23 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     # ---------------------------------------------------------------------------
     # Helper Functions
     # ---------------------------------------------------------------------------
-    # Prompt template matching the training format
-    PROMPT_TEMPLATE = "# Task: Generate HTML/CSS code using Tailwind CSS\n# Requirements: {requirements}\n\n"
-
     def load_test_data(hf_dataset: str) -> list[dict]:
-        """Load test data from HuggingFace dataset."""
+        """Load test split from HuggingFace dataset.
+
+        Expects lilyzhng/UIGEN-T1.1-split (test split) with columns:
+          id, question, answer
+        These are loaded directly — no text parsing or regex needed.
+        """
         from datasets import load_dataset
 
         dataset = load_dataset(hf_dataset, split="test")
         samples = []
-
-        for i, item in enumerate(dataset):
-            text = item["text"]
-            lines = text.split("\n")
-            requirements = ""
-            for line in lines:
-                if line.startswith("# Requirements:"):
-                    requirements = line.replace("# Requirements:", "").strip()
-                    break
-
-            full_prompt = PROMPT_TEMPLATE.format(requirements=requirements)
-
-            code_match = re.search(r"```(?:html)?\s*\n(.*?)```", text, re.DOTALL)
-            answer = code_match.group(1).strip() if code_match else ""
-
+        for item in dataset:
             samples.append({
-                "id": f"test_{i}",
-                "question": full_prompt,
-                "requirements": requirements,
-                "answer": answer,
+                "id": str(item["id"]),
+                "question": item["question"],
+                "answer": item["answer"],
             })
-
         return samples
 
     def extract_code(response_text: str) -> str:
@@ -384,7 +372,7 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
         ms-swift saves adapters in subdirectories like v0-.../checkpoint-N/.
         This function auto-detects the adapter location.
         """
-        from huggingface_hub import snapshot_download, list_repo_files
+        from huggingface_hub import snapshot_download
 
         # Download the full repo
         repo_path = snapshot_download(lora_repo_id)
@@ -400,6 +388,30 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
                 return root
 
         raise ValueError(f"No adapter_config.json found in {lora_repo_id}")
+
+    MOE_EXPERT_MODULES = {'gate_up_proj', 'down_proj', 'gate_proj', 'up_proj'}
+
+    def adapter_needs_merge(adapter_path: str) -> bool:
+        """Check if a LoRA adapter targets MoE expert FFN layers.
+
+        vLLM's runtime LoRA works for attention modules but crashes on MoE
+        expert layers (pack_moe AssertionError). Returns True if the adapter
+        has any expert-layer targets, meaning we must merge-then-load.
+        """
+        config_path = os.path.join(adapter_path, 'adapter_config.json')
+        with open(config_path) as f:
+            adapter_cfg = json.load(f)
+        target_modules = set(adapter_cfg.get('target_modules', []))
+        has_expert_modules = bool(target_modules & MOE_EXPERT_MODULES)
+        lora_rank = adapter_cfg.get('r', 8)
+        print(f'  Target modules: {sorted(target_modules)}')
+        print(f'  Rank: {lora_rank}')
+        print(f'  Has MoE expert layers: {has_expert_modules}')
+        if has_expert_modules:
+            print('  → Will use merge-then-load (vLLM pack_moe incompatible)')
+        else:
+            print('  → Will use vLLM runtime LoRA (fast path)')
+        return has_expert_modules, lora_rank
 
     # ---------------------------------------------------------------------------
     # Main Execution
@@ -440,18 +452,21 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     # ---------------------------------------------------------------------------
     has_lora = not config.base_only and config.lora_model is not None
     lora_local_path = None
+    use_merge_path = False
+    adapter_rank = 8
 
     if has_lora:
         print(f"\nResolving LoRA adapter: {config.lora_model}")
         lora_local_path = resolve_lora_adapter(config.lora_model)
         print(f"  Adapter path: {lora_local_path}")
+        use_merge_path, adapter_rank = adapter_needs_merge(lora_local_path)
 
     # ---------------------------------------------------------------------------
-    # Load Model with vLLM (instruct model only — no runtime LoRA)
+    # Load Model with vLLM
     # ---------------------------------------------------------------------------
-    # LoRA adapters targeting MoE expert layers (gate_up_proj/down_proj) are
-    # incompatible with vLLM's pack_moe runtime adapter. Instead, we merge
-    # the adapter into the base model using PEFT and reload for the LoRA pass.
+    # Two LoRA eval strategies depending on adapter target modules:
+    #   1. Attention-only adapters → vLLM runtime LoRA (fast, no reload needed)
+    #   2. MoE expert-layer adapters → merge-then-load (vLLM pack_moe crashes)
 
     # Resolve model: FP8 (default) or bf16
     if config.use_fp8:
@@ -466,18 +481,27 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     print("=" * 60)
 
     from vllm import LLM, SamplingParams
+    from vllm.config import CompilationConfig
+
+    use_runtime_lora = has_lora and not use_merge_path
 
     llm_kwargs = dict(
         model=model_to_load,
         dtype="bfloat16",
         gpu_memory_utilization=0.92,
-        max_model_len=16384,
+        max_model_len=4096,
         trust_remote_code=True,
+        compilation_config=CompilationConfig(cudagraph_mode="PIECEWISE"),
     )
     if quantization:
         llm_kwargs["quantization"] = quantization
+    if use_runtime_lora:
+        llm_kwargs["enable_lora"] = True
+        llm_kwargs["max_lora_rank"] = adapter_rank
 
     print(f"Loading model: {model_to_load}" + (" (FP8)" if quantization else ""))
+    if use_runtime_lora:
+        print(f"  Runtime LoRA enabled (rank={adapter_rank})")
     llm = LLM(**llm_kwargs)
     print(f"Model loaded! Memory: {torch.cuda.memory_allocated() / 1024**3:.1f} GB")
 
@@ -527,29 +551,58 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     print("GENERATING — INSTRUCT MODEL")
     print("=" * 60)
 
-    prompts = [s["question"] for s in samples]
+    # Build chat-format conversations so the model's ChatML template is applied.
+    # llm.chat() wraps each question in <|im_start|>user...<|im_end|> automatically,
+    # matching the format the instruct model and LoRA adapters were trained with.
+    conversations = [[{"role": "user", "content": s["question"]}] for s in samples]
 
     t0 = time.time()
-    base_outputs = llm.generate(prompts, sampling_params)
+    base_outputs = llm.chat(conversations, sampling_params)
     base_elapsed = time.time() - t0
     base_texts = [out.outputs[0].text for out in base_outputs]
     total_base_tokens = sum(len(out.outputs[0].token_ids) for out in base_outputs)
-    print(f"Instruct generation done: {len(prompts)} samples, {total_base_tokens} tokens, {base_elapsed:.1f}s ({total_base_tokens/base_elapsed:.0f} tok/s)")
+    print(f"Instruct generation done: {len(conversations)} samples, {total_base_tokens} tokens, {base_elapsed:.1f}s ({total_base_tokens/base_elapsed:.0f} tok/s)")
+
+    vllm_cache_vol.commit()
 
     wandb.log({"instruct_generation_time_s": round(base_elapsed, 1), "instruct_total_tokens": total_base_tokens})
 
     # ---------------------------------------------------------------------------
-    # Batch Generate — finetuned model (LoRA via merge-then-load)
+    # Batch Generate — finetuned model (LoRA)
     # ---------------------------------------------------------------------------
-    # vLLM's runtime LoRA adapter for MoE models (pack_moe) crashes with an
-    # AssertionError on gate_up_proj/down_proj LoRA weights. Workaround: destroy
-    # the vLLM instance, merge LoRA into the base model using PEFT, then reload
-    # vLLM with the merged model.
     lora_texts = [""] * len(samples)
 
-    if has_lora:
+    if has_lora and use_runtime_lora:
+        # Fast path: attention-only adapter → vLLM runtime LoRA (no reload)
+        from vllm.lora.request import LoRARequest
+
         print("\n" + "=" * 60)
-        print("GENERATING — FINETUNED MODEL (LoRA via merge)")
+        print("GENERATING — FINETUNED MODEL (vLLM runtime LoRA)")
+        print("=" * 60)
+        print(f"  Adapter: {lora_local_path} (rank={adapter_rank})")
+
+        lora_request = LoRARequest("finetuned", 1, lora_local_path)
+
+        t0 = time.time()
+        lora_outputs = llm.chat(conversations, sampling_params, lora_request=lora_request)
+        lora_elapsed = time.time() - t0
+        lora_texts = [out.outputs[0].text for out in lora_outputs]
+        total_lora_tokens = sum(len(out.outputs[0].token_ids) for out in lora_outputs)
+        print(f"LoRA generation done: {len(conversations)} samples, {total_lora_tokens} tokens, {lora_elapsed:.1f}s ({total_lora_tokens/lora_elapsed:.0f} tok/s)")
+
+        wandb.log({"lora_generation_time_s": round(lora_elapsed, 1), "lora_total_tokens": total_lora_tokens})
+
+        del llm
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+
+    elif has_lora and use_merge_path:
+        # Slow path: MoE expert-layer adapter → merge weights then reload.
+        # vLLM's pack_moe crashes with AssertionError on gate_up_proj/down_proj
+        # LoRA weights, so we merge on CPU and reload the full model.
+        print("\n" + "=" * 60)
+        print("GENERATING — FINETUNED MODEL (LoRA merge-then-load)")
         print("=" * 60)
 
         print("Destroying vLLM instance to free GPU memory...")
@@ -558,7 +611,7 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
         import gc
         gc.collect()
 
-        print(f"Merging LoRA adapter into base model...")
+        print("Merging LoRA adapter into base model...")
         print(f"  Base: {config.base_model}")
         print(f"  Adapter: {lora_local_path}")
 
@@ -592,8 +645,9 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
             model=merge_dir,
             dtype="bfloat16",
             gpu_memory_utilization=0.92,
-            max_model_len=16384,
+            max_model_len=4096,
             trust_remote_code=True,
+            compilation_config=CompilationConfig(cudagraph_mode="PIECEWISE"),
         )
         if config.use_fp8:
             merged_llm_kwargs["quantization"] = "fp8"
@@ -602,16 +656,21 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
         print(f"  Merged model loaded! Memory: {torch.cuda.memory_allocated() / 1024**3:.1f} GB")
 
         t0 = time.time()
-        lora_outputs = llm_merged.generate(prompts, sampling_params)
+        lora_outputs = llm_merged.chat(conversations, sampling_params)
         lora_elapsed = time.time() - t0
         lora_texts = [out.outputs[0].text for out in lora_outputs]
         total_lora_tokens = sum(len(out.outputs[0].token_ids) for out in lora_outputs)
-        print(f"LoRA generation done: {len(prompts)} samples, {total_lora_tokens} tokens, {lora_elapsed:.1f}s ({total_lora_tokens/lora_elapsed:.0f} tok/s)")
+        print(f"LoRA generation done: {len(conversations)} samples, {total_lora_tokens} tokens, {lora_elapsed:.1f}s ({total_lora_tokens/lora_elapsed:.0f} tok/s)")
 
         wandb.log({"lora_generation_time_s": round(lora_elapsed, 1), "lora_total_tokens": total_lora_tokens})
 
         del llm_merged
         torch.cuda.empty_cache()
+        gc.collect()
+    else:
+        del llm
+        torch.cuda.empty_cache()
+        import gc
         gc.collect()
 
     # ---------------------------------------------------------------------------
@@ -823,7 +882,7 @@ def main(
     download_only: bool = False,
     run_name: str = None,
     local_output: str = "wandb/eval_results",
-    max_new_tokens: int = 8192,
+    max_new_tokens: int = 2048,
 ):
     """Run UIUX evaluation for Qwen3-Coder-Next (instruct, MoE) on Modal.
 
@@ -883,7 +942,7 @@ def main(
         runs = sorted({f.split("/results/")[1].split("/")[0] for f in all_files if "/results/" in f})
         for r in runs:
             print(f"  {r}")
-        print(f"\nTo download a specific run: modal run ... --download-only --run-name <name>")
+        print("\nTo download a specific run: modal run ... --download-only --run-name <name>")
         return
 
     # Download results

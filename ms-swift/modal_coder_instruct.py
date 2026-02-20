@@ -7,28 +7,29 @@ For raw continuous text pre-training, use modal_coder_base.py (swift pt) instead
 
 ms-swift handles MoE models well: QLoRA, router aux loss, multi-GPU.
 
+Dataset: lilyzhng/UIGEN-T1.1-split (645 train / 80 val / 80 test, split from smirki/UIGEN-T1.1-TAILWIND).
+ms-swift loads the 'train' split by default. The 'test' split is reserved for eval (modal_eval_instruct.py).
+
 IMPORTANT: Always use --detach. The 80B MoE model takes several minutes to load, apply
 LoRA, and JIT-compile the first training step. Without --detach, Modal's local heartbeat
 will time out and kill the job before training even starts.
 
 Usage:
-    # UIGEN-T1.1-TAILWIND (question/answer) — 1 epoch, 2× B200
+    # Standard run — 1 epoch on train split, 2× B200
     modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
-      --dataset-name smirki/UIGEN-T1.1-TAILWIND \\
       --max-steps -1 --num-epochs 1 --gpu-type B200 --num-gpus 2
 
     # Quick test (30 steps)
-    modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
-      --dataset-name smirki/UIGEN-T1.1-TAILWIND --max-steps 30
+    modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py --max-steps 30
 
-    # Limit dataset size
-    modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
-      --dataset-name smirki/UIGEN-T1.1-TAILWIND --train-size 1000
+    # Attention-only LoRA (compatible with vLLM runtime LoRA for MoE)
+    modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py --max-steps 30 \\
+      --target-modules "q_proj k_proj v_proj o_proj"
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 import modal
 
@@ -80,6 +81,9 @@ class TrainingConfig:
     # LoRA
     lora_rank: int = 8
     lora_alpha: int = 16
+    target_modules: List[str] = field(
+        default_factory=lambda: ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_up_proj', 'down_proj']
+    )
 
     # Training
     learning_rate: float = 2e-4
@@ -94,8 +98,9 @@ class TrainingConfig:
     # MoE-specific
     router_aux_loss_coef: float = 1e-3
 
-    # Dataset — HuggingFace dataset with question/answer or messages (e.g. smirki/UIGEN-T1.1-TAILWIND)
-    dataset_name: str = None
+    # Dataset — HuggingFace dataset with question/answer or messages columns.
+    # Defaults to the pre-split dataset (train split only, test reserved for eval).
+    dataset_name: str = 'lilyzhng/UIGEN-T1.1-split'
     train_size: int = None
 
     # Logging
@@ -121,7 +126,9 @@ class TrainingConfig:
         if self.experiment_name is None:
             timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
             model_short = self.model_name.split('/')[-1]
-            self.experiment_name = f'{model_short}-sft-r{self.lora_rank}-{timestamp}'
+            attn_only = set(self.target_modules) == {'q_proj', 'k_proj', 'v_proj', 'o_proj'}
+            suffix = '-attn' if attn_only else ''
+            self.experiment_name = f'{model_short}-sft-r{self.lora_rank}{suffix}-{timestamp}'
         if self.hf_repo_name is None:
             self.hf_repo_name = self.experiment_name
 
@@ -201,10 +208,6 @@ def _finetune_impl(config: TrainingConfig):
 
     os.environ['WANDB_PROJECT'] = config.wandb_project
 
-    if not config.dataset_name:
-        raise ValueError(
-            'Must specify --dataset-name (HuggingFace dataset, e.g. question/answer or messages)'
-        )
     dataset_str = config.dataset_name
     if config.train_size:
         dataset_str = f'{config.dataset_name}#{config.train_size}'
@@ -219,6 +222,7 @@ def _finetune_impl(config: TrainingConfig):
     print(f'Model: {config.model_name} (80B total, 3B active, 512 experts)')
     print('Quantization: BNB 4-bit NF4 (QLoRA)')
     print(f'LoRA: rank={config.lora_rank}, alpha={config.lora_alpha}')
+    print(f'LoRA targets: {" ".join(config.target_modules)}')
     print(f'Dataset: {dataset_str}')
     print(f'Training: {num_epochs} epoch(s), max {max_steps} steps')
     print(f'Batch: {config.batch_size} x {config.gradient_accumulation_steps} '
@@ -229,9 +233,6 @@ def _finetune_impl(config: TrainingConfig):
     print(f'Output: {output_dir}')
     print(f'Experiment: {config.experiment_name}')
     print('=' * 80 + '\n')
-
-    # swift sft = supervised fine-tuning (chat template, loss on response by default)
-    target_modules_str = 'q_proj k_proj v_proj o_proj gate_up_proj down_proj'
 
     if config.num_gpus > 1:
         import subprocess
@@ -245,7 +246,7 @@ def _finetune_impl(config: TrainingConfig):
             '--tuner_type', 'lora',
             '--lora_rank', str(config.lora_rank),
             '--lora_alpha', str(config.lora_alpha),
-            '--target_modules', *target_modules_str.split(),
+            '--target_modules', *config.target_modules,
             '--quant_method', 'bnb',
             '--quant_bits', '4',
             '--bnb_4bit_compute_dtype', 'bfloat16',
@@ -288,7 +289,7 @@ def _finetune_impl(config: TrainingConfig):
             tuner_type='lora',
             lora_rank=config.lora_rank,
             lora_alpha=config.lora_alpha,
-            target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_up_proj', 'down_proj'],
+            target_modules=config.target_modules,
 
             quant_method='bnb',
             quant_bits=4,
@@ -385,6 +386,7 @@ def main(
     hf_private: bool = None,
     router_aux_loss_coef: float = None,
     num_gpus: int = None,
+    target_modules: str = None,
 ):
     """
     Launch Qwen3-Coder-Next SFT (instruction tuning) on Modal with ms-swift.
@@ -393,14 +395,16 @@ def main(
 
     Always use --detach (80B MoE takes minutes to load; without it, heartbeat timeout kills the job).
 
+    Default dataset: lilyzhng/UIGEN-T1.1-split (train split, 645 samples).
+    Pass --dataset-name to override with a different HF dataset.
+
     Examples:
-        # UIGEN-T1.1-TAILWIND, 1 epoch, 2× B200
+        # Standard 1-epoch run on default dataset, 2× B200
         modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
-            --dataset-name smirki/UIGEN-T1.1-TAILWIND --num-epochs 1 --max-steps -1 --gpu-type B200 --num-gpus 2
+            --num-epochs 1 --max-steps -1 --gpu-type B200 --num-gpus 2
 
         # Quick test (30 steps)
-        modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
-            --dataset-name smirki/UIGEN-T1.1-TAILWIND --max-steps 30
+        modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py --max-steps 30
     """
     config_dict = {}
     for key, val in {
@@ -427,6 +431,9 @@ def main(
         if val is not None:
             config_dict[key] = val
 
+    if target_modules is not None:
+        config_dict['target_modules'] = target_modules.split()
+
     config = TrainingConfig(**config_dict)
 
     print('=' * 80)
@@ -440,6 +447,7 @@ def main(
     else:
         print('  Training samples: full dataset')
     print(f'LoRA: rank={config.lora_rank}, alpha={config.lora_alpha}')
+    print(f'LoRA targets: {" ".join(config.target_modules)}')
     print(f'Batch: {config.batch_size} x {config.gradient_accumulation_steps} '
           f'= {config.batch_size * config.gradient_accumulation_steps}')
     print(f'Training: {config.num_epochs} epoch(s), max {config.max_steps} steps')
