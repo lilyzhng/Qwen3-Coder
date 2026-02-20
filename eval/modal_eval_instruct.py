@@ -38,6 +38,7 @@ eval_image = (
     .pip_install(
         'vllm',
         'flashinfer-python',
+        'peft',
         'datasets',
         'hf-transfer',
         'wandb',
@@ -58,7 +59,7 @@ eval_image = (
 model_cache_vol = modal.Volume.from_name("uiux-model-cache", create_if_missing=True)
 results_vol = modal.Volume.from_name("uiux-eval-results", create_if_missing=True)
 
-# GPU config — H200 for FP8 instruct + LoRA eval (vLLM MoE+LoRA kernel fails on B200/Blackwell)
+# GPU config — H200 for FP8 instruct + LoRA eval
 GPU_CONFIG = "H200"
 TIMEOUT_HOURS = 4
 
@@ -439,32 +440,18 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     # ---------------------------------------------------------------------------
     has_lora = not config.base_only and config.lora_model is not None
     lora_local_path = None
-    lora_rank = 64  # default
 
     if has_lora:
         print(f"\nResolving LoRA adapter: {config.lora_model}")
         lora_local_path = resolve_lora_adapter(config.lora_model)
         print(f"  Adapter path: {lora_local_path}")
 
-        # Read adapter rank from config
-        adapter_config_path = os.path.join(lora_local_path, "adapter_config.json")
-        if os.path.exists(adapter_config_path):
-            with open(adapter_config_path) as f:
-                adapter_cfg = json.load(f)
-            lora_rank = adapter_cfg.get("r", 64)
-            print(f"  LoRA rank: {lora_rank}")
-
     # ---------------------------------------------------------------------------
-    # Load Model with vLLM
+    # Load Model with vLLM (instruct model only — no runtime LoRA)
     # ---------------------------------------------------------------------------
-    # vLLM's fused MoE LoRA Triton kernel fails on B200/Blackwell.
-    if has_lora and torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0) or ""
-        if "B200" in gpu_name or "Blackwell" in gpu_name:
-            raise ValueError(
-                "vLLM MoE + LoRA is not supported on B200/Blackwell (fused_moe_lora_op Triton kernel fails). "
-                "This script uses H200 by default. If you changed GPU_CONFIG, set it back to 'H200'."
-            )
+    # LoRA adapters targeting MoE expert layers (gate_up_proj/down_proj) are
+    # incompatible with vLLM's pack_moe runtime adapter. Instead, we merge
+    # the adapter into the base model using PEFT and reload for the LoRA pass.
 
     # Resolve model: FP8 (default) or bf16
     if config.use_fp8:
@@ -490,12 +477,7 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     if quantization:
         llm_kwargs["quantization"] = quantization
 
-    if has_lora:
-        llm_kwargs["enable_lora"] = True
-        llm_kwargs["max_lora_rank"] = lora_rank
-
     print(f"Loading model: {model_to_load}" + (" (FP8)" if quantization else ""))
-    print(f"  LoRA enabled: {has_lora}")
     llm = LLM(**llm_kwargs)
     print(f"Model loaded! Memory: {torch.cuda.memory_allocated() / 1024**3:.1f} GB")
 
@@ -557,26 +539,80 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     wandb.log({"instruct_generation_time_s": round(base_elapsed, 1), "instruct_total_tokens": total_base_tokens})
 
     # ---------------------------------------------------------------------------
-    # Batch Generate — finetuned model (LoRA)
+    # Batch Generate — finetuned model (LoRA via merge-then-load)
     # ---------------------------------------------------------------------------
+    # vLLM's runtime LoRA adapter for MoE models (pack_moe) crashes with an
+    # AssertionError on gate_up_proj/down_proj LoRA weights. Workaround: destroy
+    # the vLLM instance, merge LoRA into the base model using PEFT, then reload
+    # vLLM with the merged model.
     lora_texts = [""] * len(samples)
 
     if has_lora:
         print("\n" + "=" * 60)
-        print("GENERATING — FINETUNED MODEL (LoRA)")
+        print("GENERATING — FINETUNED MODEL (LoRA via merge)")
         print("=" * 60)
 
-        from vllm.lora.request import LoRARequest
-        lora_request = LoRARequest("finetuned", 1, lora_local_path)
+        print("Destroying vLLM instance to free GPU memory...")
+        del llm
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+
+        print(f"Merging LoRA adapter into base model...")
+        print(f"  Base: {config.base_model}")
+        print(f"  Adapter: {lora_local_path}")
+
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        merge_dir = "/tmp/merged_model"
+
+        tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
+        print("  Loading base model for merge (this takes a few minutes)...")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            config.base_model,
+            torch_dtype=torch.bfloat16,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+        print("  Applying LoRA adapter...")
+        merged_model = PeftModel.from_pretrained(base_model, lora_local_path)
+        print("  Merging weights...")
+        merged_model = merged_model.merge_and_unload()
+        print(f"  Saving merged model to {merge_dir}...")
+        merged_model.save_pretrained(merge_dir)
+        tokenizer.save_pretrained(merge_dir)
+
+        del base_model, merged_model
+        torch.cuda.empty_cache()
+        gc.collect()
+        print("  Merge complete. Loading merged model into vLLM...")
+
+        merged_llm_kwargs = dict(
+            model=merge_dir,
+            dtype="bfloat16",
+            gpu_memory_utilization=0.92,
+            max_model_len=16384,
+            trust_remote_code=True,
+        )
+        if config.use_fp8:
+            merged_llm_kwargs["quantization"] = "fp8"
+
+        llm_merged = LLM(**merged_llm_kwargs)
+        print(f"  Merged model loaded! Memory: {torch.cuda.memory_allocated() / 1024**3:.1f} GB")
 
         t0 = time.time()
-        lora_outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
+        lora_outputs = llm_merged.generate(prompts, sampling_params)
         lora_elapsed = time.time() - t0
         lora_texts = [out.outputs[0].text for out in lora_outputs]
         total_lora_tokens = sum(len(out.outputs[0].token_ids) for out in lora_outputs)
         print(f"LoRA generation done: {len(prompts)} samples, {total_lora_tokens} tokens, {lora_elapsed:.1f}s ({total_lora_tokens/lora_elapsed:.0f} tok/s)")
 
         wandb.log({"lora_generation_time_s": round(lora_elapsed, 1), "lora_total_tokens": total_lora_tokens})
+
+        del llm_merged
+        torch.cuda.empty_cache()
+        gc.collect()
 
     # ---------------------------------------------------------------------------
     # Process Results (screenshots, judging, W&B)
