@@ -200,12 +200,13 @@ def _diagnose_dataset(dataset_str: str, max_length: int, batch_size: int):
 
     Prints:
       1. Raw HF split sizes (how many rows the hub has)
-      2. ms-swift load_dataset output (after AutoPreprocessor)
-      3. Expected steps/epoch given batch_size
-
-    Any discrepancy between (1) and (2) tells us exactly where samples
-    are being dropped or filtered.
+      2. Row-by-row preprocessor run to capture the EXACT drop reason for each failed row
+      3. ms-swift load_dataset output (after AutoPreprocessor)
+      4. Expected steps/epoch given batch_size
     """
+    import math
+    from collections import Counter
+
     print('\n' + '─' * 80)
     print('DATASET DIAGNOSTIC (pre-training)')
     print('─' * 80)
@@ -216,10 +217,63 @@ def _diagnose_dataset(dataset_str: str, max_length: int, batch_size: int):
         raw = hf_load_dataset(dataset_str.split('#')[0])
         for split_name, split_ds in raw.items():
             print(f'  HF raw  [{split_name:>12s}]: {len(split_ds):>6} rows')
+        raw_train = raw['train']
+        n_raw = len(raw_train)
     except Exception as e:
         print(f'  HF raw load failed: {e}')
+        print('─' * 80 + '\n')
+        return
 
-    # ── Stage 2: ms-swift load_dataset (after AutoPreprocessor) ─────────────
+    # ── Stage 2: row-by-row preprocessor to capture exact drop reasons ──────
+    try:
+        from swift.dataset.preprocessor.core import AutoPreprocessor
+        preprocessor = AutoPreprocessor()
+        # _get_preprocessor picks MessagesPreprocessor for our dataset
+        row_preprocessor = preprocessor._get_preprocessor(raw_train)
+
+        drop_reasons = Counter()
+        dropped_examples = []  # store up to 3 examples for inspection
+
+        for i, row in enumerate(raw_train):
+            row = dict(row)
+            try:
+                result = row_preprocessor.preprocess(row)
+                if result is None:
+                    reason = 'preprocess() returned None'
+                    drop_reasons[reason] += 1
+                    if len(dropped_examples) < 3:
+                        dropped_examples.append((i, reason, row))
+            except Exception as e:
+                reason = type(e).__name__ + ': ' + str(e)[:120]
+                drop_reasons[reason] += 1
+                if len(dropped_examples) < 3:
+                    dropped_examples.append((i, reason, row))
+
+        n_dropped = sum(drop_reasons.values())
+        n_kept = n_raw - n_dropped
+
+        print(f'\n  Preprocessor results ({row_preprocessor.__class__.__name__}):')
+        print(f'    kept   : {n_kept:>6} / {n_raw}')
+        print(f'    dropped: {n_dropped:>6} / {n_raw}')
+
+        if n_dropped > 0:
+            print(f'\n  Drop reasons:')
+            for reason, count in drop_reasons.most_common():
+                print(f'    [{count:>4}×] {reason}')
+            print(f'\n  First dropped row examples:')
+            for idx, reason, row in dropped_examples:
+                msgs = row.get('messages', [])
+                msg_preview = f'{len(msgs)} messages' if msgs else 'NO messages'
+                content_len = sum(len(str(m.get('content', ''))) for m in msgs)
+                print(f'    row {idx:>4}: {reason}')
+                print(f'             messages={msg_preview}, total_content_chars={content_len}')
+        else:
+            print('    ✓ All rows pass the preprocessor.')
+
+    except Exception as e:
+        print(f'  Row-by-row preprocess failed: {e}')
+
+    # ── Stage 3: ms-swift load_dataset end-to-end ───────────────────────────
     try:
         from swift.dataset import load_dataset as swift_load_dataset
         train_ds, val_ds = swift_load_dataset(
@@ -230,34 +284,12 @@ def _diagnose_dataset(dataset_str: str, max_length: int, batch_size: int):
             load_from_cache_file=False,
         )
         n_train = len(train_ds) if train_ds is not None else 0
-        n_val = len(val_ds) if val_ds is not None else 0
-        print(f'  swift   [       train]: {n_train:>6} rows  (after AutoPreprocessor)')
-        if n_val:
-            print(f'  swift   [         val]: {n_val:>6} rows')
+        print(f'\n  swift load_dataset [train]: {n_train:>6} rows')
 
-        # ── Stage 3: expected steps ─────────────────────────────────────────
-        import math
         expected_steps = math.ceil(n_train / batch_size)
         print(f'\n  max_length  : {max_length}')
         print(f'  batch_size  : {batch_size}')
-        print(f'  train rows  : {n_train}')
         print(f'  expect steps: ~{expected_steps} / epoch')
-
-        # Warn on significant drop
-        try:
-            raw_train = len(hf_load_dataset(dataset_str.split('#')[0])['train'])
-            dropped = raw_train - n_train
-            if dropped > 0:
-                pct = 100 * dropped / raw_train
-                print(f'\n  ⚠ {dropped} rows dropped by ms-swift ({pct:.1f}% of raw train)')
-                print(f'    Likely cause: samples tokenise to >{max_length} tokens '
-                      f'and ms-swift drops (not truncates) them.')
-                print(f'    To investigate: set strict=True in AutoPreprocessor '
-                      f'or increase max_length.')
-            else:
-                print(f'\n  ✓ No rows dropped — all {n_train} samples will be trained.')
-        except Exception:
-            pass
 
     except Exception as e:
         print(f'  swift load_dataset failed: {e}')
