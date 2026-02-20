@@ -337,5 +337,26 @@
         "content": "**Root cause:** The command was run without `--detach`. The 80B MoE model takes several minutes to load weights, apply QLoRA, and JIT-compile the first training step. After ~2:50 with no completed step, Modal's local client heartbeat timed out and killed the remote app. The `RemoteError` is wrapping the cancellation, not an actual training error.\n\nThe model was fine — LoRA applied correctly, training was about to start its first step. But Modal's default heartbeat for non-detached runs has a timeout shorter than the model's cold-start time.\n\n**This is NOT a code/training bug.** It's a usage issue: `--detach` must always be used for 80B MoE models because loading + first-step compilation exceeds the heartbeat timeout.\n\n**Fix:** Updated all examples in modal_coder_instruct.py to always use `--detach`, including the \"quick test\" examples that previously omitted it. Added a prominent note:\n\n```\nIMPORTANT: Always use --detach. The 80B MoE model takes several minutes to load, apply\nLoRA, and JIT-compile the first training step. Without --detach, Modal's local heartbeat\nwill time out and kill the job before training even starts.\n```\n\nCorrect command:\n```\nmodal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\\n  --dataset-name smirki/UIGEN-T1.1-TAILWIND --max-steps 30\n```"
       }
     ]
+  },
+  {
+    "bug_id": "ms-swift-23",
+    "title": "W&B init too late — run URL hidden and results lost on crash",
+    "timestamp": "2026-02-19 23:20 PST",
+    "commit": "3aed858",
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Project: Qwen3-Coder-Next evaluation pipeline on Modal. Scripts: modal_eval_moe.py (base model eval) and modal_eval_instruct.py (instruct model eval). Both use vLLM for generation, Playwright for screenshots, OpenRouter for judging, and W&B for logging. GPU: H200 with FP8 quantization."
+      },
+      {
+        "role": "user",
+        "content": "In the modal link, I didn't find the wandb anywhere. Did we forget to trigger the wandb to store the result one by one?\n\nThe W&B run URL never appears in the Modal dashboard logs. I ran the eval job with --detach and checked the remote logs, but there's no wandb link visible."
+      },
+      {
+        "role": "assistant",
+        "content": "**Root cause:** `wandb.init()` was called in the \"Process Results\" section, which runs *after* both generation passes (instruct/base model + LoRA) complete. For an 80B MoE model, each generation pass takes 30-60+ minutes, so the W&B run URL only appears ~60+ min into the job. Worse, if the job crashes during generation, W&B was never initialized, so all results are lost.\n\nThe generation timing (`base_generation_time_s`, `lora_generation_time_s`) was also passed via `wandb_config` at init time, which required both generations to finish before `wandb.init()` could be called — a circular dependency.\n\n**Fix applied to both `modal_eval_moe.py` and `modal_eval_instruct.py`:**\n\n1. Moved `wandb.init()` to right after `SamplingParams` setup (before any generation starts). The W&B run URL now prints immediately after model loading.\n\n2. Removed generation timing from the `wandb_config` dict (which is set at init time).\n\n3. Added `wandb.log()` calls immediately after each generation pass:\n   - After instruct/base generation: `wandb.log({\"instruct_generation_time_s\": ..., \"instruct_total_tokens\": ...})`\n   - After LoRA generation: `wandb.log({\"lora_generation_time_s\": ..., \"lora_total_tokens\": ...})`\n\nThe per-sample judging results were already logged incrementally in the loop, so no changes needed there.\n\nNow if the job crashes mid-generation, the W&B run still exists (with config info), and any completed generation timing is already logged."
+      }
+    ]
   }
 ]
