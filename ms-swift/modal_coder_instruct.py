@@ -269,7 +269,7 @@ def _finetune_impl(config: TrainingConfig):
             '--output_dir', output_dir,
             '--report_to', 'wandb',
             '--run_name', config.experiment_name,
-            '--gradient_checkpointing', 'false',
+            '--gradient_checkpointing', 'true',
             '--seed', str(config.seed),
             '--dataloader_num_workers', '8',
             '--load_from_cache_file', 'false',  # always re-preprocess; avoids stale cached dataset
@@ -320,7 +320,7 @@ def _finetune_impl(config: TrainingConfig):
             report_to=['wandb'],
             run_name=config.experiment_name,
 
-            gradient_checkpointing=False,
+            gradient_checkpointing=True,
 
             seed=config.seed,
             dataloader_num_workers=8,
