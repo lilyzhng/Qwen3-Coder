@@ -88,7 +88,7 @@ class TrainingConfig:
     # Training
     learning_rate: float = 2e-4
     num_epochs: int = 1
-    max_steps: int = 30  # Set to -1 to use num_epochs
+    max_steps: int = -1  # -1 = use num_epochs; set to a positive int for a quick smoke-test
     batch_size: int = 2
     gradient_accumulation_steps: int = 1
     warmup_steps: int = 10
