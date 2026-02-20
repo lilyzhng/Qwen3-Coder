@@ -1,27 +1,26 @@
 """
-Evaluate Qwen3-Coder-Next-Base (80B MoE) on Modal with GPU.
+Evaluate Qwen3-Coder-Next (80B MoE, instruct) on Modal with vLLM FP8 inference.
 
-Compares a base model against a finetuned LoRA model on the same test data.
-Uses vLLM for fast inference. Both runs are logged to W&B for easy comparison.
+Compares the instruct model against a finetuned LoRA adapter on the same test data.
+Uses vLLM for fast inference on H200. Both runs are logged to W&B for easy comparison.
+
+For base-model evaluation, use modal_eval_moe.py instead.
 
 Usage:
-    # Evaluate both base and finetuned models (default: 20 samples)
-    modal run Qwen3-Coder/eval/modal_eval_moe.py
+    # FP8 instruct + LoRA adapter on H200
+    modal run --detach Qwen3-Coder/eval/modal_eval_instruct.py \\
+      --lora-model lilyzhng/my-lora-adapter
 
     # Custom limit
-    modal run Qwen3-Coder/eval/modal_eval_moe.py --limit 50
+    modal run --detach Qwen3-Coder/eval/modal_eval_instruct.py \\
+      --lora-model lilyzhng/my-lora-adapter --limit 50
 
-    # Custom LoRA model
-    modal run Qwen3-Coder/eval/modal_eval_moe.py --lora-model lilyzhng/my-lora-adapter
-
-    # Only evaluate base model (no LoRA)
-    modal run Qwen3-Coder/eval/modal_eval_moe.py --base-only
-
-    # FP8 base + LoRA on H200 (set GPU_CONFIG = 'H200' in file; fits in 141GB)
-    modal run Qwen3-Coder/eval/modal_eval_moe.py --fp8-base --lora-model lilyzhng/my-lora-adapter
+    # Instruct model only (no LoRA comparison)
+    modal run --detach Qwen3-Coder/eval/modal_eval_instruct.py --base-only
 
     # Skip judge (faster, no scoring)
-    modal run Qwen3-Coder/eval/modal_eval_moe.py --no-judge
+    modal run --detach Qwen3-Coder/eval/modal_eval_instruct.py \\
+      --lora-model lilyzhng/my-lora-adapter --no-judge
 """
 
 from dataclasses import dataclass
@@ -30,7 +29,7 @@ import modal
 # ---------------------------------------------------------------------------
 # Modal App & Infrastructure
 # ---------------------------------------------------------------------------
-app = modal.App("uiux-eval-moe")
+app = modal.App("uiux-eval-instruct")
 
 # Container image — uses vLLM for fast inference
 eval_image = (
@@ -59,28 +58,28 @@ eval_image = (
 model_cache_vol = modal.Volume.from_name("uiux-model-cache", create_if_missing=True)
 results_vol = modal.Volume.from_name("uiux-eval-results", create_if_missing=True)
 
-# GPU config — B200 for 80B MoE base eval; for LoRA eval use H200 or H100 (vLLM MoE+LoRA kernel fails on B200)
+# GPU config — H200 for FP8 instruct + LoRA eval (vLLM MoE+LoRA kernel fails on B200/Blackwell)
 GPU_CONFIG = "H200"
 TIMEOUT_HOURS = 4
 
-# Pre-quantized FP8 base for base-vs-LoRA comparison on H200 (fits in 141GB).
-# LoRA trained on bf16 base is compatible. When using --fp8-base with LoRA, set GPU_CONFIG = "H200" above.
-FP8_BASE_MODEL = "unsloth/Qwen3-Coder-Next-FP8"
+# FP8-quantized instruct model (Qwen3-Coder-Next, NOT the base model).
+# LoRA adapters trained on bf16 instruct base are compatible with FP8 inference.
+FP8_MODEL = "unsloth/Qwen3-Coder-Next-FP8"
 
 
 @dataclass
 class EvalConfig:
-    """Configuration for side-by-side comparison evaluation."""
-    base_model: str = "Qwen/Qwen3-Coder-Next-Base"
-    lora_model: str = None  # HuggingFace LoRA adapter ID (e.g. lilyzhng/Qwen3-Coder-Next-Base-swift-r8-...)
+    """Configuration for instruct model evaluation."""
+    base_model: str = "Qwen/Qwen3-Coder-Next"
+    lora_model: str = None  # HuggingFace LoRA adapter ID (e.g. lilyzhng/Qwen3-Coder-Next-sft-r8-...)
     hf_dataset: str = "lilyzhng/uigen-ui-code-gen-full"
     output_base_dir: str = "/results"
     limit: int = 20
     judge_model: str = "google/gemini-3-pro-preview"
     wandb_project: str = "uiux-eval"
     use_judge: bool = True
-    base_only: bool = False  # Only evaluate base model, skip LoRA
-    use_fp8_base: bool = False  # Use FP8-quantized base (e.g. unsloth/Qwen3-Coder-Next-FP8) to fit on H200 with LoRA
+    base_only: bool = False  # Only evaluate instruct model, skip LoRA
+    use_fp8: bool = True  # FP8 inference (default on — instruct model fits on H200 in FP8)
     max_new_tokens: int = 8192
 
 
@@ -138,11 +137,11 @@ def run_evaluation(config: EvalConfig):
 </html>
 """
 
-    # Card template for 3-column comparison: Ground Truth | Base Generation | Finetuned Generation
+    # Card template for 3-column comparison: Ground Truth | Instruct Generation | Finetuned Generation
     WANDB_CARD_TEMPLATE = """\
 <div style="font-family: system-ui, -apple-system, sans-serif; width: 100%; box-sizing: border-box;">
   <div style="background: #f8f9fa; border-radius: 8px; padding: 16px; margin-bottom: 16px;">
-    <div style="font-size: 14px; color: #666; margin-bottom: 4px;">ID: {sample_id} &bull; Base Score: {base_score}/10 &bull; Finetuned Score: {lora_score}/10</div>
+    <div style="font-size: 14px; color: #666; margin-bottom: 4px;">ID: {sample_id} &bull; Instruct Score: {base_score}/10 &bull; Finetuned Score: {lora_score}/10</div>
     <div style="font-size: 16px; font-weight: 600; color: #1a1a1a;">{prompt}</div>
   </div>
   <div style="display: flex; gap: 16px; margin-bottom: 16px; width: 100%;">
@@ -151,7 +150,7 @@ def run_evaluation(config: EvalConfig):
       <img src="data:image/png;base64,{gt_b64}" style="width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px;" />
     </div>
     <div style="flex: 1; min-width: 0;">
-      <div style="font-size: 14px; font-weight: 600; color: #3498db; margin-bottom: 8px;">Base Model</div>
+      <div style="font-size: 14px; font-weight: 600; color: #3498db; margin-bottom: 8px;">Instruct Model</div>
       <img src="data:image/png;base64,{base_b64}" style="width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px;" />
     </div>
     <div style="flex: 1; min-width: 0;">
@@ -161,8 +160,8 @@ def run_evaluation(config: EvalConfig):
   </div>
   <div style="background: #fafafa; border-radius: 6px; padding: 12px; font-size: 14px;">
     <div style="margin-bottom: 8px;">
-      <span style="font-weight: 600; color: #3498db;">Base Failure Modes:</span> {base_failure_modes}<br/>
-      <span style="font-weight: 600; color: #3498db;">Base Reasoning:</span> {base_reasoning}
+      <span style="font-weight: 600; color: #3498db;">Instruct Failure Modes:</span> {base_failure_modes}<br/>
+      <span style="font-weight: 600; color: #3498db;">Instruct Reasoning:</span> {base_reasoning}
     </div>
     <div>
       <span style="font-weight: 600; color: #9b59b6;">Finetuned Failure Modes:</span> {lora_failure_modes}<br/>
@@ -171,7 +170,7 @@ def run_evaluation(config: EvalConfig):
   </div>
 </div>"""
 
-    # 2-column card for base-only mode
+    # 2-column card for instruct-only mode (no LoRA)
     WANDB_CARD_BASE_ONLY_TEMPLATE = """\
 <div style="font-family: system-ui, -apple-system, sans-serif; width: 100%; box-sizing: border-box;">
   <div style="background: #f8f9fa; border-radius: 8px; padding: 16px; margin-bottom: 16px;">
@@ -184,7 +183,7 @@ def run_evaluation(config: EvalConfig):
       <img src="data:image/png;base64,{gt_b64}" style="width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px;" />
     </div>
     <div style="flex: 1; min-width: 0;">
-      <div style="font-size: 14px; font-weight: 600; color: #3498db; margin-bottom: 8px;">Base Model</div>
+      <div style="font-size: 14px; font-weight: 600; color: #3498db; margin-bottom: 8px;">Instruct Model</div>
       <img src="data:image/png;base64,{base_b64}" style="width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px;" />
     </div>
   </div>
@@ -404,12 +403,14 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     # ---------------------------------------------------------------------------
     # Main Execution
     # ---------------------------------------------------------------------------
+    actual_model = FP8_MODEL if config.use_fp8 else config.base_model
+
     print("=" * 60)
-    print("UIUX Evaluation — Qwen3-Coder-Next-Base (MoE) [vLLM]")
+    print("UIUX Evaluation — Qwen3-Coder-Next (instruct, MoE) [vLLM]")
     print("=" * 60)
-    print(f"Base model: {config.base_model}")
-    print(f"LoRA model: {config.lora_model or '(none — base only)'}")
-    print(f"Use FP8 base: {config.use_fp8_base}")
+    print(f"Model: {actual_model}" + (" (FP8)" if config.use_fp8 else ""))
+    print(f"LoRA model: {config.lora_model or '(none — instruct only)'}")
+    print(f"FP8 inference: {config.use_fp8}")
     print(f"HF Dataset: {config.hf_dataset}")
     print(f"Limit: {config.limit}")
     print(f"Use judge: {config.use_judge}")
@@ -456,23 +457,18 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     # ---------------------------------------------------------------------------
     # Load Model with vLLM
     # ---------------------------------------------------------------------------
-    # vLLM's fused MoE LoRA Triton kernel fails on B200/Blackwell: "tt.elementwise_inline_asm
-    # op pipeliner doesn't know how to predicate this op" at gdc_wait(). Fail fast with a clear
-    # message instead of crashing during LLM() init.
+    # vLLM's fused MoE LoRA Triton kernel fails on B200/Blackwell.
     if has_lora and torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0) or ""
         if "B200" in gpu_name or "Blackwell" in gpu_name:
             raise ValueError(
                 "vLLM MoE + LoRA is not supported on B200/Blackwell (fused_moe_lora_op Triton kernel fails). "
-                "You are on B200 because GPU_CONFIG at the top of this file is 'B200'. "
-                "--fp8-base only selects the FP8 model; it does NOT change the GPU. "
-                "Edit modal_eval_moe.py: set GPU_CONFIG = 'H200' (e.g. line ~63), then re-run with "
-                "--fp8-base --lora-model <your-adapter> so the job runs on H200."
+                "This script uses H200 by default. If you changed GPU_CONFIG, set it back to 'H200'."
             )
 
-    # Resolve base model: FP8 pre-quantized for H200 LoRA comparison, or bf16 default
-    if config.use_fp8_base:
-        model_to_load = FP8_BASE_MODEL
+    # Resolve model: FP8 (default) or bf16
+    if config.use_fp8:
+        model_to_load = FP8_MODEL
         quantization = "fp8"
     else:
         model_to_load = config.base_model
@@ -528,7 +524,7 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
 
     wandb_config = {
         "base_model": model_to_load,
-        "use_fp8_base": config.use_fp8_base,
+        "use_fp8": config.use_fp8,
         "lora_model": config.lora_model,
         "judge_model": config.judge_model if config.use_judge else "none",
         "num_samples": len(samples),
@@ -544,10 +540,10 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     print(f"W&B run: {run.url}")
 
     # ---------------------------------------------------------------------------
-    # Batch Generate — base model
+    # Batch Generate — instruct model
     # ---------------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print("GENERATING — BASE MODEL")
+    print("GENERATING — INSTRUCT MODEL")
     print("=" * 60)
 
     prompts = [s["question"] for s in samples]
@@ -557,9 +553,9 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     base_elapsed = time.time() - t0
     base_texts = [out.outputs[0].text for out in base_outputs]
     total_base_tokens = sum(len(out.outputs[0].token_ids) for out in base_outputs)
-    print(f"Base generation done: {len(prompts)} samples, {total_base_tokens} tokens, {base_elapsed:.1f}s ({total_base_tokens/base_elapsed:.0f} tok/s)")
+    print(f"Instruct generation done: {len(prompts)} samples, {total_base_tokens} tokens, {base_elapsed:.1f}s ({total_base_tokens/base_elapsed:.0f} tok/s)")
 
-    wandb.log({"base_generation_time_s": round(base_elapsed, 1), "base_total_tokens": total_base_tokens})
+    wandb.log({"instruct_generation_time_s": round(base_elapsed, 1), "instruct_total_tokens": total_base_tokens})
 
     # ---------------------------------------------------------------------------
     # Batch Generate — finetuned model (LoRA)
@@ -649,13 +645,13 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
         lora_judgment = {}
 
         if config.use_judge and openrouter_client:
-            print("  Judging base model output...")
+            print("  Judging instruct model output...")
             base_judgment = judge_output(
                 openrouter_client, config.judge_model,
                 question, base_extracted, reference, base_img, gt_img
             )
             base_judgments.append(base_judgment)
-            print(f"  Base Score: {base_judgment.get('score', '?')}/10")
+            print(f"  Instruct Score: {base_judgment.get('score', '?')}/10")
 
             if has_lora:
                 print("  Judging finetuned model output...")
@@ -735,7 +731,7 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
     wandb.summary["inference_backend"] = "vllm"
 
     print(f"\n{'='*40}")
-    print(f"Base Model Avg Score: {base_avg:.1f}/10")
+    print(f"Instruct Model Avg Score: {base_avg:.1f}/10")
     if has_lora:
         print(f"Finetuned Model Avg Score: {lora_avg:.1f}/10")
         print(f"Improvement: {lora_avg - base_avg:+.1f}")
@@ -786,29 +782,29 @@ def read_file(path: str) -> bytes:
 def main(
     limit: int = 20,
     no_judge: bool = False,
-    base_model: str = "Qwen/Qwen3-Coder-Next-Base",
     lora_model: str = None,
     base_only: bool = False,
-    fp8_base: bool = False,
+    no_fp8: bool = False,
     download_only: bool = False,
     run_name: str = None,
     local_output: str = "wandb/eval_results",
     max_new_tokens: int = 8192,
 ):
-    """Run UIUX evaluation for Qwen3-Coder-Next-Base (MoE) on Modal.
+    """Run UIUX evaluation for Qwen3-Coder-Next (instruct, MoE) on Modal.
+
+    Uses FP8 inference by default (unsloth/Qwen3-Coder-Next-FP8 on H200).
 
     Side-by-side comparison in W&B:
     - Column 1: Ground Truth
-    - Column 2: Base Model Generation
+    - Column 2: Instruct Model Generation
     - Column 3: Finetuned Model Generation (if --lora-model provided)
 
     Args:
         limit: Number of test samples to evaluate
         no_judge: Skip LLM judging
-        base_model: Base model HF ID (ignored if fp8_base=True)
         lora_model: Finetuned LoRA adapter HF ID
-        base_only: Only evaluate base model (no LoRA comparison)
-        fp8_base: Use FP8-quantized base (unsloth/Qwen3-Coder-Next-FP8) to fit on H200 with LoRA
+        base_only: Only evaluate instruct model (no LoRA comparison)
+        no_fp8: Disable FP8 quantization (use bf16 instead — requires more VRAM)
         download_only: Only download existing results
         run_name: Specific run name to download (used with --download-only)
         local_output: Base directory for local results
@@ -819,23 +815,25 @@ def main(
 
     if not download_only:
         if not base_only and not lora_model:
-            print("WARNING: No --lora-model provided. Running base-only evaluation.")
-            print("  To compare base vs finetuned, pass --lora-model <hf_repo_id>")
+            print("WARNING: No --lora-model provided. Running instruct-only evaluation.")
+            print("  To compare instruct vs finetuned, pass --lora-model <hf_repo_id>")
             base_only = True
 
+        use_fp8 = not no_fp8
+        actual_model = FP8_MODEL if use_fp8 else "Qwen/Qwen3-Coder-Next"
+
         config = EvalConfig(
-            base_model=base_model,
             lora_model=lora_model,
             limit=limit,
             use_judge=not no_judge,
             base_only=base_only,
-            use_fp8_base=fp8_base,
+            use_fp8=use_fp8,
             max_new_tokens=max_new_tokens,
         )
 
         print("Starting UIUX evaluation on Modal (vLLM backend)...")
-        print(f"  Base model: {config.base_model}" + (" (FP8)" if config.use_fp8_base else ""))
-        print(f"  LoRA model: {config.lora_model or '(base only)'}")
+        print(f"  Model: {actual_model}" + (" (FP8)" if use_fp8 else ""))
+        print(f"  LoRA model: {config.lora_model or '(instruct only)'}")
         print(f"  Limit: {config.limit}")
         print(f"  Max new tokens: {config.max_new_tokens}")
         print(f"  Use judge: {config.use_judge}")
@@ -850,7 +848,7 @@ def main(
         runs = sorted({f.split("/results/")[1].split("/")[0] for f in all_files if "/results/" in f})
         for r in runs:
             print(f"  {r}")
-        print("\nTo download a specific run: modal run ... --download-only --run-name <name>")
+        print(f"\nTo download a specific run: modal run ... --download-only --run-name <name>")
         return
 
     # Download results
