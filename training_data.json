@@ -316,5 +316,26 @@
         "content": "**Two fixes applied:**\n\n1. **Follow document-bug-fixes:** Commit the code changes in the appropriate repo (Qwen3-Coder), then append a new entry to training_data.json with the conversation, commit hash, and timestamp from `date`.\n\n2. **Correct model name:** The SFT script (modal_coder_instruct.py) is for instruction-tuning the **instruct** model, not the base model. Updated all references and the default model from `Qwen/Qwen3-Coder-Next-Base` to `Qwen/Qwen3-Coder-Next` in modal_coder_instruct.py:\n- Docstring: \"Fine-tune Qwen3-Coder-Next (80B MoE, instruct) on Modal using ms-swift SFT\"\n- Image pre-download: `snapshot_download('Qwen/Qwen3-Coder-Next', ...)`\n- TrainingConfig.model_name default: `'Qwen/Qwen3-Coder-Next'`\n- All user-facing print/docs: \"Qwen3-Coder-Next\" not \"Qwen3-Coder-Next-Base\"\n\nmodal_coder_base.py remains the PT script and still uses Qwen3-Coder-Next-Base; only the instruct script uses the instruct model.\n\nCommitted in Qwen3-Coder as 0ba5b85; this entry added to training_data.json."
       }
     ]
+  },
+  {
+    "bug_id": "ms-swift-22",
+    "title": "Modal heartbeat timeout kills 80B MoE training without --detach",
+    "timestamp": "2026-02-19 22:05 PST",
+    "commit": "21b11c7",
+    "path": "ms-swift",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Project: SFT fine-tuning Qwen3-Coder-Next (80B MoE, instruct) on Modal using ms-swift with QLoRA. Script: Qwen3-Coder/ms-swift/modal_coder_instruct.py. GPU: B200."
+      },
+      {
+        "role": "user",
+        "content": "Training dies immediately on launch with RemoteError. The model loads and LoRA is applied successfully (506M trainable, 1.24%), but training shows 0% after 2:50 and then the app is killed:\n\n```\nStopping app - local client disconnected. Use `modal run --detach` to keep apps running even if your local client disconnects.\nmodal.exception.ConflictError: App state is APP_STATE_STOPPED\n[INFO:swift] last_model_checkpoint: None\nTrain:   0%|          | 0/30 [02:50<?, ?it/s]\nRemoteError\n```\n\nCommand was:\n```\nmodal run Qwen3-Coder/ms-swift/modal_coder_instruct.py --dataset-name smirki/UIGEN-T1.1-TAILWIND --max-steps 30\n```"
+      },
+      {
+        "role": "assistant",
+        "content": "**Root cause:** The command was run without `--detach`. The 80B MoE model takes several minutes to load weights, apply QLoRA, and JIT-compile the first training step. After ~2:50 with no completed step, Modal's local client heartbeat timed out and killed the remote app. The `RemoteError` is wrapping the cancellation, not an actual training error.\n\nThe model was fine — LoRA applied correctly, training was about to start its first step. But Modal's default heartbeat for non-detached runs has a timeout shorter than the model's cold-start time.\n\n**This is NOT a code/training bug.** It's a usage issue: `--detach` must always be used for 80B MoE models because loading + first-step compilation exceeds the heartbeat timeout.\n\n**Fix:** Updated all examples in modal_coder_instruct.py to always use `--detach`, including the \"quick test\" examples that previously omitted it. Added a prominent note:\n\n```\nIMPORTANT: Always use --detach. The 80B MoE model takes several minutes to load, apply\nLoRA, and JIT-compile the first training step. Without --detach, Modal's local heartbeat\nwill time out and kill the job before training even starts.\n```\n\nCorrect command:\n```\nmodal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\\n  --dataset-name smirki/UIGEN-T1.1-TAILWIND --max-steps 30\n```"
+      }
+    ]
   }
 ]
