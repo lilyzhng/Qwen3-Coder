@@ -88,7 +88,7 @@ class TrainingConfig:
     learning_rate: float = 2e-4
     num_epochs: int = 1
     max_steps: int = -1  # -1 = use num_epochs; set to a positive int for a quick smoke-test
-    batch_size: int = 2
+    batch_size: int = 1
     gradient_accumulation_steps: int = 1
     warmup_steps: int = 10
     weight_decay: float = 0.01
@@ -269,7 +269,7 @@ def _finetune_impl(config: TrainingConfig):
             '--output_dir', output_dir,
             '--report_to', 'wandb',
             '--run_name', config.experiment_name,
-            '--gradient_checkpointing', 'true',
+            '--gradient_checkpointing', 'false',
             '--seed', str(config.seed),
             '--dataloader_num_workers', '8',
             '--load_from_cache_file', 'false',  # always re-preprocess; avoids stale cached dataset
@@ -320,7 +320,7 @@ def _finetune_impl(config: TrainingConfig):
             report_to=['wandb'],
             run_name=config.experiment_name,
 
-            gradient_checkpointing=True,
+            gradient_checkpointing=False,
 
             seed=config.seed,
             dataloader_num_workers=8,
