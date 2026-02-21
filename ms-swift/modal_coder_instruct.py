@@ -15,9 +15,9 @@ LoRA, and JIT-compile the first training step. Without --detach, Modal's local h
 will time out and kill the job before training even starts.
 
 Usage:
-    # Standard run — 1 epoch on train split, 2× B200
+    # Standard run — 1 epoch on train split, 1× B200
     modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
-      --max-steps -1 --num-epochs 1 --gpu-type B200 --num-gpus 2
+      --max-steps -1 --num-epochs 1 --gpu-type B200
 
     # Quick test (30 steps)
     modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py --max-steps 30
@@ -81,7 +81,7 @@ class TrainingConfig:
     lora_rank: int = 8
     lora_alpha: int = 16
     target_modules: List[str] = field(
-        default_factory=lambda: ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_up_proj', 'down_proj']
+        default_factory=lambda: ['q_proj', 'k_proj', 'v_proj', 'o_proj']
     )
 
     # Training
@@ -400,9 +400,9 @@ def main(
     Pass --dataset-name to override with a different HF dataset.
 
     Examples:
-        # Standard 1-epoch run on default dataset, 2× B200
+        # Standard 1-epoch run on default dataset, 1× B200
         modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py \\
-            --num-epochs 1 --max-steps -1 --gpu-type B200 --num-gpus 2
+            --num-epochs 1 --max-steps -1 --gpu-type B200
 
         # Quick test (30 steps)
         modal run --detach Qwen3-Coder/ms-swift/modal_coder_instruct.py --max-steps 30
