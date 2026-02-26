@@ -149,6 +149,11 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# Local symlinks (journal, PROGRESS.md, wandb results)
+journal
+PROGRESS.md
+wandb/
+
 # pytype static type analyzer
 .pytype/
 

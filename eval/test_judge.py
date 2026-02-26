@@ -212,7 +212,7 @@ def extract_json_from_response(raw_content: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Fixtures path
 # ---------------------------------------------------------------------------
-FIXTURES_DIR = Path(__file__).parent.parent.parent / 'wandb' / 'eval_results' / \
+FIXTURES_DIR = Path(__file__).parent.parent / 'wandb' / 'eval_results' / \
     'comparison-Qwen3-Coder-Next-FP8-vs-Qwen3-Coder-Next-sft-r8-attn-20260220-074051-0226-0411'
 
 SAMPLE_IDS = ['376', '589', '649', '680', '737']
