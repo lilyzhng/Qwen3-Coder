@@ -199,28 +199,27 @@ def run_evaluation(config: EvalConfig):
     JUDGE_PROMPT = """\
 You are a UI code quality judge. Rate the generation from 1-10.
 
+CRITICAL: Screenshots are attached below the code. The SCREENSHOT is the ground truth for what the code actually renders. If the screenshot shows a working UI, the code is NOT broken — even if the code snippet appears truncated. Always trust the screenshot over the code text.
+
 SCORING RUBRIC (start at 10, subtract for issues):
-- broken-code (-4): syntax errors, blank page, no output
-- broken-layout (-3): elements overlap, misaligned, unusable
-- wrong-framework (-2): doesn't use Tailwind CSS
+- broken-code (-4): screenshot shows blank page or error — NOT just truncated code
+- broken-layout (-3): screenshot shows elements overlap, misaligned, unusable
+- wrong-framework (-2): doesn't use Tailwind CSS (check for tailwind classes in code)
 - generic-colors (-2): boring default palette
 - no-design-thinking (-2): looks like developer prototype
 - missing-states (-1): no hover/transition polish
 
 TASK: {prompt}
 
-GENERATION:
+GENERATION (may be truncated — refer to the screenshot for actual rendered output):
 {model_output}
 
 GROUND TRUTH:
 {reference}
 
-IMPORTANT: You MUST respond with ONLY a valid JSON object. No other text before or after.
-Do not explain your reasoning outside the JSON. Put all reasoning inside the "reasoning" field.
+Respond with ONLY a JSON object. No other text before or after.
 
-```json
-{{"score": <1-10>, "failure_modes": ["<mode1>", "<mode2>"], "reasoning": "<brief explanation with penalty math>"}}
-```"""
+{{"score": <1-10>, "failure_modes": ["<mode1>", "<mode2>"], "reasoning": "<brief explanation>"}}"""
 
     # ---------------------------------------------------------------------------
     # Helper Functions
@@ -283,10 +282,182 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
                 return base64.b64encode(f.read()).decode("utf-8")
         return ""
 
+    def extract_json_from_response(raw_content: str) -> dict | None:
+        """Extract a JSON object from a judge response using brace-counting.
+
+        Handles: clean JSON, ```json fences, text preamble before JSON,
+        escaped quotes inside strings, and nested structures.
+        Returns the parsed dict or None if no valid JSON found.
+        """
+        if not raw_content or not raw_content.strip():
+            return None
+
+        text = raw_content.strip()
+
+        # Strip markdown fences if present (anywhere in the text)
+        text = re.sub(r'```(?:json)?\s*\n?', '', text)
+        text = re.sub(r'\n?```\s*', '', text)
+
+        # Find the first '{' and extract JSON by brace counting
+        start = text.find('{')
+        if start == -1:
+            return None
+
+        depth = 0
+        in_string = False
+        escape_next = False
+        end = start
+
+        for i in range(start, len(text)):
+            ch = text[i]
+
+            if escape_next:
+                escape_next = False
+                continue
+
+            if ch == '\\' and in_string:
+                escape_next = True
+                continue
+
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if in_string:
+                continue
+
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+
+        # Sanitize newlines inside string values (common in judge reasoning)
+        def sanitize_string_values(s):
+            result = []
+            in_str = False
+            esc = False
+            for c in s:
+                if esc:
+                    result.append(c)
+                    esc = False
+                    continue
+                if c == '\\' and in_str:
+                    result.append(c)
+                    esc = True
+                    continue
+                if c == '"':
+                    in_str = not in_str
+                    result.append(c)
+                    continue
+                if in_str and c in ('\n', '\r'):
+                    result.append(' ')
+                    continue
+                result.append(c)
+            return ''.join(result)
+
+        def try_parse(json_str):
+            json_str = sanitize_string_values(json_str)
+            try:
+                parsed = json.loads(json_str)
+                if isinstance(parsed, dict) and 'score' in parsed:
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+            return None
+
+        if depth == 0:
+            json_str = text[start:end]
+            return try_parse(json_str)
+
+        # Truncated JSON — judge response was cut off.
+        # Try to repair by closing open strings/arrays/objects.
+        json_str = text[start:]
+
+        # Attempt 1: close the string + close braces/brackets
+        repair = json_str.rstrip().rstrip(',')
+        if in_string:
+            repair += '"'
+        bracket_depth = 0
+        str_mode = False
+        esc_mode = False
+        for c in repair:
+            if esc_mode:
+                esc_mode = False
+                continue
+            if c == '\\' and str_mode:
+                esc_mode = True
+                continue
+            if c == '"':
+                str_mode = not str_mode
+                continue
+            if str_mode:
+                continue
+            if c == '[':
+                bracket_depth += 1
+            elif c == ']':
+                bracket_depth -= 1
+        repair += ']' * max(bracket_depth, 0)
+        repair += '}' * depth
+
+        result = try_parse(repair)
+        if result:
+            return result
+
+        # Attempt 2: truncate to the last complete key-value pair
+        last_comma = -1
+        str_mode = False
+        esc_mode = False
+        for idx, c in enumerate(json_str):
+            if esc_mode:
+                esc_mode = False
+                continue
+            if c == '\\' and str_mode:
+                esc_mode = True
+                continue
+            if c == '"':
+                str_mode = not str_mode
+                continue
+            if str_mode:
+                continue
+            if c == ',':
+                last_comma = idx
+
+        if last_comma > 0:
+            truncated = json_str[:last_comma]
+            bracket_depth = 0
+            str_mode = False
+            esc_mode = False
+            for c in truncated:
+                if esc_mode:
+                    esc_mode = False
+                    continue
+                if c == '\\' and str_mode:
+                    esc_mode = True
+                    continue
+                if c == '"':
+                    str_mode = not str_mode
+                    continue
+                if str_mode:
+                    continue
+                if c == '[':
+                    bracket_depth += 1
+                elif c == ']':
+                    bracket_depth -= 1
+            truncated += ']' * max(bracket_depth, 0)
+            truncated += '}'
+            result = try_parse(truncated)
+            if result:
+                return result
+
+        return None
+
     def judge_output(client, judge_model, prompt, model_output, reference, gen_img, gt_img, max_retries: int = 2) -> dict:
         judge_text = JUDGE_PROMPT.format(
             prompt=prompt,
-            model_output=model_output[:4000],
+            model_output=model_output[:8000],
             reference=reference[:4000],
         )
         content_parts = [{"type": "text", "text": judge_text}]
@@ -329,33 +500,9 @@ Do not explain your reasoning outside the JSON. Put all reasoning inside the "re
                     last_error = "Empty response"
                     continue
 
-                raw_content = raw_content.strip()
-
-                content = raw_content
-                if content.startswith("```"):
-                    content = re.sub(r"^```(?:json)?\s*\n?", "", content)
-                    content = re.sub(r"\n?```\s*$", "", content)
-
-                json_match = re.search(r"\{[^{}]*(?:\[[^\[\]]*\][^{}]*)*\}", content, re.DOTALL)
-                if json_match:
-                    json_str = json_match.group()
-                    json_str = re.sub(r'(?<=: ")(.*?)(?=")', lambda m: m.group(1).replace('\n', ' ').replace('\r', ''), json_str, flags=re.DOTALL)
-                    try:
-                        parsed = json.loads(json_str)
-                        if "score" in parsed:
-                            return parsed
-                        last_error = "Missing score field"
-                        continue
-                    except json.JSONDecodeError as e:
-                        last_error = f"JSON parse error: {e}"
-                        continue
-
-                try:
-                    parsed = json.loads(content)
-                    if "score" in parsed:
-                        return parsed
-                except json.JSONDecodeError:
-                    pass
+                parsed = extract_json_from_response(raw_content)
+                if parsed:
+                    return parsed
 
                 last_error = f"No JSON in response: {raw_content[:100]}..."
                 continue
