@@ -207,6 +207,7 @@ SCORING RUBRIC (start at 10, subtract for issues):
 - wrong-framework (-2): doesn't use Tailwind CSS (check for tailwind classes in code)
 - generic-colors (-2): boring default palette
 - no-design-thinking (-2): looks like developer prototype
+- visible-artifacts (-3): screenshot shows raw code, markdown fences, or explanatory text rendered visibly on the page
 - missing-states (-1): no hover/transition polish
 
 TASK: {prompt}
@@ -244,10 +245,17 @@ Respond with ONLY a JSON object. No other text before or after.
         return samples
 
     def extract_code(response_text: str) -> str:
+        # Try matching complete fenced code blocks first
         pattern = r"```(?:html|css|tsx|jsx|vue)?\s*\n(.*?)```"
         matches = re.findall(pattern, response_text, re.DOTALL)
         if matches:
             return "\n".join(matches)
+        # Handle truncated output: opening fence but no closing fence
+        # (common when model hits max_new_tokens before closing ```)
+        open_pattern = r"```(?:html|css|tsx|jsx|vue)?\s*\n(.*)"
+        open_match = re.search(open_pattern, response_text, re.DOTALL)
+        if open_match:
+            return open_match.group(1).strip()
         stripped = response_text.strip()
         if stripped.startswith("<") or stripped.startswith("<!"):
             return stripped
@@ -849,7 +857,8 @@ Respond with ONLY a JSON object. No other text before or after.
         # Process HTML
         base_extracted = extract_code(base_raw)
         base_html = wrap_in_html(base_extracted, f"Base-{sample_id}")
-        gt_html = wrap_in_html(reference, f"GT-{sample_id}")
+        gt_extracted = extract_code(reference)
+        gt_html = wrap_in_html(gt_extracted, f"GT-{sample_id}")
 
         # Save files
         base_path = os.path.join(output_dir, f"{sample_id}_base.html")

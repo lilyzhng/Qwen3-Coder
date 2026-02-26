@@ -222,6 +222,98 @@ def fixture_path(filename: str) -> Path:
     return FIXTURES_DIR / filename
 
 
+# ---------------------------------------------------------------------------
+# extract_code — replicated from modal_eval_instruct.py
+# ---------------------------------------------------------------------------
+
+def extract_code(response_text: str) -> str:
+    """Extract HTML/code from a model response, stripping markdown fences and preamble."""
+    # Try matching complete fenced code blocks first
+    pattern = r"```(?:html|css|tsx|jsx|vue)?\s*\n(.*?)```"
+    matches = re.findall(pattern, response_text, re.DOTALL)
+    if matches:
+        return "\n".join(matches)
+    # Handle truncated output: opening fence but no closing fence
+    # (common when model hits max_new_tokens before closing ```)
+    open_pattern = r"```(?:html|css|tsx|jsx|vue)?\s*\n(.*)"
+    open_match = re.search(open_pattern, response_text, re.DOTALL)
+    if open_match:
+        return open_match.group(1).strip()
+    stripped = response_text.strip()
+    if stripped.startswith("<") or stripped.startswith("<!"):
+        return stripped
+    return stripped
+
+
+# ===========================================================================
+# Unit Tests — extract_code (no API calls)
+# ===========================================================================
+
+class TestExtractCode:
+    """Test extract_code handles complete, truncated, and bare code."""
+
+    def test_complete_fence(self):
+        raw = '```html\n<!DOCTYPE html>\n<html><body>Hello</body></html>\n```'
+        result = extract_code(raw)
+        assert result.startswith('<!DOCTYPE html>')
+        assert '```' not in result
+
+    def test_fence_with_preamble(self):
+        raw = 'Here is a complete, single-file solution.\n\n```html\n<!DOCTYPE html>\n<html><body>Timer</body></html>\n```'
+        result = extract_code(raw)
+        assert result.startswith('<!DOCTYPE html>')
+        assert 'single-file solution' not in result
+
+    def test_truncated_fence_no_closing(self):
+        """Model hit max_new_tokens before closing ```. Should still extract code."""
+        raw = 'Here is the solution:\n\n```html\n<!DOCTYPE html>\n<html>\n<head><title>Timer</title></head>\n<body>\n<div>Pomodoro</div>'
+        result = extract_code(raw)
+        assert result.startswith('<!DOCTYPE html>')
+        assert 'Here is the solution' not in result
+        assert '```' not in result
+
+    def test_truncated_fence_with_long_preamble(self):
+        """Real-world case: model outputs explanation + code, hits token limit."""
+        raw = """Here is a complete, single-file solution containing HTML, CSS, and JavaScript.
+
+This app features a "Pomodoro-style" workflow (Focus / Short Break / Long Break) with a smooth, animated circular progress bar and a pastel color palette.
+
+### How to use this:
+1. Copy the code block below.
+2. Create a new file named `timer.html`.
+3. Open it in any web browser.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Pastel Focus Timer</title>
+    <style>
+        body { font-family: sans-serif; }
+    </style>
+</head>
+<body>
+<div class="timer">25:00</div>"""
+        result = extract_code(raw)
+        assert result.startswith('<!DOCTYPE html>')
+        assert 'How to use this' not in result
+        assert 'Pomodoro-style' not in result
+
+    def test_bare_html_no_fence(self):
+        """Output is pure HTML without any markdown fences."""
+        raw = '<!DOCTYPE html>\n<html><body>Hello</body></html>'
+        result = extract_code(raw)
+        assert result.startswith('<!DOCTYPE html>')
+
+    def test_gt_with_fences(self):
+        """Ground truth answer wrapped in ```html...``` fences."""
+        raw = '```html\n<!DOCTYPE html>\n<html class="bg-pastel">\n<body>Timer</body>\n</html>\n```'
+        result = extract_code(raw)
+        assert result.startswith('<!DOCTYPE html>')
+        assert '```' not in result
+
+
 # ===========================================================================
 # Unit Tests — JSON Parsing (no API calls)
 # ===========================================================================
